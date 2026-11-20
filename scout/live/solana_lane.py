@@ -1103,6 +1103,310 @@ def read_persisted_intent(
 
 
 # ----------------------------------------------------------------------
+# Reconciling AFTER the run — what a later `resolve` compares against
+# ----------------------------------------------------------------------
+@dataclass(frozen=True)
+class ReconciliationBasis:
+    """Every number the forward reconciliation compares the chain against.
+
+    Named so that the run that made the swap and a later ``resolve`` hand
+    ``_reconcile`` the same seven integers and nothing else — there is one
+    reconciliation, and which process is running it changes only where these
+    came from: the live quote, inspection report and balance probe, or the
+    evidence file those were written to before the approval prompt.
+    """
+
+    amount_lamports: int
+    min_out_raw: int
+    quoted_out_raw: int
+    total_fee_lamports: int
+    ata_rent_lamports: int
+    sol_before_lamports: int
+    usdc_before_raw: int
+
+    @classmethod
+    def from_run(
+        cls,
+        *,
+        quote: SolanaQuote,
+        report: VerificationReport,
+        balance: dict[str, Any],
+        amount_lamports: int,
+    ) -> "ReconciliationBasis":
+        return cls(
+            amount_lamports=amount_lamports,
+            min_out_raw=quote.min_out_amount,
+            quoted_out_raw=quote.out_amount,
+            total_fee_lamports=report.total_fee_lamports,
+            ata_rent_lamports=int(balance["ata_rent_lamports"]),
+            sol_before_lamports=int(balance["sol_balance_lamports"]),
+            usdc_before_raw=int(balance["usdc_balance_raw"]),
+        )
+
+
+def _strict_int(value: Any) -> int | None:
+    """``value`` if it is a non-negative integer, else None.
+
+    ``bool`` is excluded on purpose: it IS an ``int`` in Python, and a
+    ``true`` that reached this from a damaged record would read as one
+    lamport rather than as the damage it is.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def read_evidence_steps(
+    evidence_dir: str | Path, decision_id: str
+) -> dict[str, dict[str, Any]]:
+    """The LAST record of every step in one decision's evidence file.
+
+    Same failure contract as ``read_persisted_intent``: anything unreadable is
+    simply absent, and the caller treats absence as "cannot prove it".
+    """
+    path = evidence_path_for(evidence_dir, decision_id)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    steps: dict[str, dict[str, Any]] = {}
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and isinstance(entry.get("step"), str):
+            steps[entry["step"]] = entry
+    return steps
+
+
+def read_reconciliation_basis(
+    evidence_dir: str | Path,
+    decision_id: str,
+    *,
+    execution: dict[str, Any],
+    signature: str,
+) -> tuple[ReconciliationBasis | None, str | None, list[str]]:
+    """Rebuild what the run would have reconciled against, or say why not.
+
+    Returns ``(basis, signer_pubkey, problems)``. A basis is returned ONLY when
+    ``problems`` is empty.
+
+    The numbers come from the evidence file, and a file is not a database: it
+    can be missing, truncated, or belong to a run that is not this one. So
+    nothing in it is taken on its own word. Every figure that also exists in
+    ``solana_executions`` — the swap amount, the on-chain minimum, the message
+    hash, the signature — must match the row exactly, and every figure the file
+    states twice must match itself. Any disagreement, any absence and any value
+    that is not a plain non-negative integer is a problem, and one problem is
+    enough: a reconciliation computed from numbers nobody can vouch for is not
+    a weaker reconciliation, it is not one.
+    """
+    steps = read_evidence_steps(evidence_dir, decision_id)
+    problems: list[str] = []
+
+    def _step(name: str) -> dict[str, Any]:
+        found = steps.get(name)
+        if found is None:
+            problems.append(f"the evidence file carries no '{name}' record")
+            return {}
+        return found
+
+    def _int(step: dict[str, Any], name: str, key: str) -> int | None:
+        if not step:
+            return None
+        value = _strict_int(step.get(key))
+        if value is None:
+            problems.append(
+                f"evidence '{name}'.{key} is {step.get(key)!r}, not a "
+                "non-negative integer"
+            )
+        return value
+
+    def _text(step: dict[str, Any], name: str, key: str) -> str | None:
+        if not step:
+            return None
+        value = step.get(key)
+        if not (isinstance(value, str) and value):
+            problems.append(f"evidence '{name}'.{key} is {value!r}, not a string")
+            return None
+        return value
+
+    def _agree(label: str, **sources: Any) -> None:
+        known = {name: value for name, value in sources.items() if value is not None}
+        if len(set(known.values())) > 1:
+            problems.append(
+                f"{label} disagrees between "
+                + ", ".join(f"{name}={value!r}" for name, value in known.items())
+            )
+
+    intent = _step(_INTENT_STEP)
+    quote = _step("quote")
+    balance = _step("balance")
+    signed = _step("signed_in_memory")
+
+    amount = _int(intent, _INTENT_STEP, "amount_lamports")
+    min_out = _int(intent, _INTENT_STEP, "min_out_amount_raw")
+    total_fee = _int(intent, _INTENT_STEP, "total_fee_lamports")
+    quoted_out = _int(quote, "quote", "out_amount_raw")
+    quote_in = _int(quote, "quote", "in_amount_raw")
+    quote_min = _int(quote, "quote", "min_out_amount_raw")
+    balance_swap = _int(balance, "balance", "swap_lamports")
+    balance_fee = _int(balance, "balance", "total_fee_lamports")
+    ata_rent = _int(balance, "balance", "ata_rent_lamports")
+    sol_before = _int(balance, "balance", "sol_balance_lamports")
+    usdc_before = _int(balance, "balance", "usdc_balance_raw")
+    intent_hash = _text(intent, _INTENT_STEP, "message_sha256")
+    signed_hash = _text(signed, "signed_in_memory", "message_sha256")
+    signed_signature = _text(signed, "signed_in_memory", "expected_signature")
+    signer_pubkey = _text(signed, "signed_in_memory", "signer_pubkey")
+
+    # The row is the authority; the file has to agree with it.
+    row_amount = _strict_int(execution.get("amount_lamports"))
+    row_min_out = _strict_int(execution.get("minimum_out_raw"))
+    row_hash = execution.get("message_sha256")
+    row_signature = execution.get("expected_signature")
+    if row_amount is None or row_min_out is None or not row_hash or not row_signature:
+        problems.append(
+            "the execution row carries no amount, minimum output, message "
+            "hash or signature to hold the evidence file against"
+        )
+    elif row_signature != signature:
+        problems.append(
+            "the execution row holds a different signature "
+            f"({row_signature!r}) from the one being resolved"
+        )
+    _agree(
+        "the swap amount",
+        execution_row=row_amount,
+        intent=amount,
+        quote=quote_in,
+        balance=balance_swap,
+    )
+    _agree(
+        "the on-chain minimum output",
+        execution_row=row_min_out,
+        intent=min_out,
+        quote=quote_min,
+    )
+    _agree("the total fee", intent=total_fee, balance=balance_fee)
+    _agree(
+        "the message hash",
+        execution_row=row_hash,
+        intent=intent_hash,
+        signed=signed_hash,
+    )
+    if intent and intent.get("decision_id") != decision_id:
+        problems.append(
+            f"the evidence file's intent is for decision "
+            f"{intent.get('decision_id')!r}, not {decision_id!r}"
+        )
+    if signed_signature is not None and signed_signature != signature:
+        problems.append(
+            "the evidence file records a different signature "
+            f"({signed_signature!r}) from the one being resolved"
+        )
+
+    if problems:
+        return None, None, problems
+    return (
+        ReconciliationBasis(
+            amount_lamports=int(amount),  # type: ignore[arg-type]
+            min_out_raw=int(min_out),  # type: ignore[arg-type]
+            quoted_out_raw=int(quoted_out),  # type: ignore[arg-type]
+            total_fee_lamports=int(total_fee),  # type: ignore[arg-type]
+            ata_rent_lamports=int(ata_rent),  # type: ignore[arg-type]
+            sol_before_lamports=int(sol_before),  # type: ignore[arg-type]
+            usdc_before_raw=int(usdc_before),  # type: ignore[arg-type]
+        ),
+        str(signer_pubkey),
+        [],
+    )
+
+
+def transaction_wallet_deltas(
+    transaction: dict[str, Any] | None, *, owner: str, mint: str
+) -> tuple[int | None, int | None, list[str]]:
+    """What ONE transaction, by its own record, did to ``owner``'s wallet.
+
+    Returns ``(lamports_spent, token_received_raw, problems)`` read from the
+    pre/post balance arrays the cluster stores with the transaction.
+
+    This exists for a reconciliation that runs LATE. The run itself measures
+    the wallet seconds after the swap, so "the wallet moved by X" and "this
+    swap moved it by X" are the same statement. Hours later they are not: the
+    wallet can have been topped up, swept, or traded from a phone, and a
+    balance delta that merely lands inside the expected range would then be
+    explaining something other than this transaction. The transaction's own
+    record does not age, so a late reconciliation is held to it exactly.
+
+    Anything missing is a problem rather than a zero. An absent token entry is
+    a real zero only when the array it would be in is present.
+    """
+    problems: list[str] = []
+    if not isinstance(transaction, dict):
+        return None, None, ["no transaction record was returned for the signature"]
+    meta = transaction.get("meta")
+    if not isinstance(meta, dict):
+        return None, None, ["the transaction record carries no meta"]
+
+    lamports_spent: int | None = None
+    keys = ((transaction.get("transaction") or {}).get("message") or {}).get(
+        "accountKeys"
+    )
+    index: int | None = None
+    if isinstance(keys, list):
+        for position, key in enumerate(keys):
+            pubkey = key.get("pubkey") if isinstance(key, dict) else key
+            if pubkey == owner:
+                index = position
+                break
+    pre = meta.get("preBalances")
+    post = meta.get("postBalances")
+    if index is None:
+        problems.append("the wallet is not among the transaction's account keys")
+    elif not (
+        isinstance(pre, list)
+        and isinstance(post, list)
+        and index < len(pre)
+        and index < len(post)
+    ):
+        problems.append("the transaction record carries no SOL balances for the wallet")
+    else:
+        before, after = _strict_int(pre[index]), _strict_int(post[index])
+        if before is None or after is None:
+            problems.append("the transaction's SOL balances are not integers")
+        else:
+            lamports_spent = before - after
+
+    def _held(entries: Any) -> int | None:
+        if not isinstance(entries, list):
+            return None
+        total = 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                return None
+            if entry.get("owner") != owner or entry.get("mint") != mint:
+                continue
+            try:
+                total += int((entry.get("uiTokenAmount") or {})["amount"])
+            except (KeyError, TypeError, ValueError):
+                return None
+        return total
+
+    token_received: int | None = None
+    held_before = _held(meta.get("preTokenBalances"))
+    held_after = _held(meta.get("postTokenBalances"))
+    if held_before is None or held_after is None:
+        problems.append("the transaction record carries no readable token balances")
+    else:
+        token_received = held_after - held_before
+    return lamports_spent, token_received, problems
+
+
+# ----------------------------------------------------------------------
 # Small numeric helpers — the chain speaks integers, the ledger speaks text.
 # ----------------------------------------------------------------------
 def _dec(value: Any) -> Decimal:
@@ -2427,6 +2731,12 @@ class LaneRunner:
             return None
         current = execution["state"]
         if current in TERMINAL_STATES:
+            return current
+        if current == target:
+            # Already there. No state lists itself as a successor, so without
+            # this a second `resolve` of a run that is still only landed would
+            # be reported as a REFUSED transition — a warning about nothing,
+            # on the command an operator runs repeatedly while waiting.
             return current
         try:
             assert_legal_transition(current, target)
@@ -4360,33 +4670,19 @@ class LaneRunner:
             confirmation["slot"] = resolution.slot
             confirmation["confirmation_status"] = resolution.confirmation_status
 
-        transaction = None
-        try:
-            transaction = await self._rpc.get_transaction(signed.signature)
-        except Exception as exc:
-            evidence.record(
-                "get_transaction_failed",
-                error_type=type(exc).__name__,
-                error=str(exc),
-            )
-        meta = (transaction or {}).get("meta") or {}
-        evidence.record(
-            "transaction_record",
-            found=transaction is not None,
-            slot=(transaction or {}).get("slot"),
-            fee_lamports=meta.get("fee"),
-            on_chain_err=meta.get("err"),
-        )
+        transaction = await self._transaction_record(evidence, signed.signature)
 
         summary = await self._reconcile(
             evidence=evidence,
             live_trade_id=live_trade_id,
             decision_id=decision_id,
             signature=signed.signature,
-            quote=quote,
-            report=report,
-            balance=balance,
-            amount_lamports=amount_lamports,
+            basis=ReconciliationBasis.from_run(
+                quote=quote,
+                report=report,
+                balance=balance,
+                amount_lamports=amount_lamports,
+            ),
             signer_pubkey=signer_pubkey,
             confirmation=confirmation,
             transaction=transaction,
@@ -4433,6 +4729,35 @@ class LaneRunner:
         # for, and a 0 here would tell a wrapper script everything is fine.
         return EXIT_REVIEW if summary["verdict"] == "review" else EXIT_OK
 
+    async def _transaction_record(
+        self, evidence: EvidenceLog, signature: str, *, commitment: str = "confirmed"
+    ) -> dict[str, Any] | None:
+        """Fetch the transaction's own record and write it into the evidence.
+
+        Never raises: a failed read is recorded and returned as None, and it
+        is for the caller to decide what an absent record is worth.
+        """
+        transaction = None
+        try:
+            transaction = await self._rpc.get_transaction(
+                signature, commitment=commitment
+            )
+        except Exception as exc:
+            evidence.record(
+                "get_transaction_failed",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+        meta = (transaction or {}).get("meta") or {}
+        evidence.record(
+            "transaction_record",
+            found=transaction is not None,
+            slot=(transaction or {}).get("slot"),
+            fee_lamports=meta.get("fee"),
+            on_chain_err=meta.get("err"),
+        )
+        return transaction
+
     async def _reconcile(
         self,
         *,
@@ -4440,15 +4765,26 @@ class LaneRunner:
         live_trade_id: int | None,
         decision_id: str,
         signature: str,
-        quote: SolanaQuote,
-        report: VerificationReport,
-        balance: dict[str, Any],
-        amount_lamports: int,
+        basis: ReconciliationBasis,
         signer_pubkey: str,
         confirmation: dict[str, Any],
         transaction: dict[str, Any] | None,
+        after_resolution: bool = False,
     ) -> dict[str, Any]:
         """Compare the chain's view, the ledger row and the balance deltas.
+
+        ``after_resolution`` marks a reconciliation that a later ``resolve``
+        is running, as opposed to the run that made the swap. Every check
+        below still applies; the flag only ADDS three, because the comparison
+        is no longer being made seconds after the trade:
+
+        * the transaction must be rooted — nothing is reconciled against
+          something a fork can still undo;
+        * the wallet's movement since the run measured it must be EXACTLY
+          what this transaction's own record says it did, so a balance that
+          was topped up or swept in the meantime cannot pass as the swap;
+        * the ledger's fill is written only once all of that agrees, so a
+          comparison that failed cannot overwrite what the run recorded.
 
         The USDC floor is ``otherAmountThreshold``, not ``outAmount``: the
         former is what the on-chain program enforces, the latter is an
@@ -4475,9 +4811,10 @@ class LaneRunner:
         except Exception as exc:
             probe_errors.append(f"get_token_balance: {type(exc).__name__}: {exc}")
 
-        sol_before = int(balance["sol_balance_lamports"])
-        usdc_before = int(balance["usdc_balance_raw"])
-        ata_rent = int(balance["ata_rent_lamports"])
+        amount_lamports = basis.amount_lamports
+        sol_before = basis.sol_before_lamports
+        usdc_before = basis.usdc_before_raw
+        ata_rent = basis.ata_rent_lamports
 
         sol_spent = None if sol_after is None else sol_before - sol_after
         usdc_received = None if usdc_after is None else usdc_after - usdc_before
@@ -4497,11 +4834,11 @@ class LaneRunner:
         if usdc_received is None:
             mismatches.append("no post-trade USDC balance to compare against")
         else:
-            meets_minimum_output = usdc_received >= quote.min_out_amount
+            meets_minimum_output = usdc_received >= basis.min_out_raw
             if not meets_minimum_output:
                 mismatches.append(
                     f"received {usdc_received} raw USDC, below the on-chain "
-                    f"minimum {quote.min_out_amount} (otherAmountThreshold) — "
+                    f"minimum {basis.min_out_raw} (otherAmountThreshold) — "
                     "the slippage bound did not hold"
                 )
 
@@ -4526,12 +4863,12 @@ class LaneRunner:
         # slippage guarantee rests on, so it has to be exactly as tight as the
         # facts allow.
         #
-        # ``report.total_fee_lamports`` already includes the rent, hence
+        # ``basis.total_fee_lamports`` already includes the rent, hence
         # subtracting it back out for the floor rather than adding it for the
         # ceiling.
-        unconditional_cost = report.total_fee_lamports - ata_rent
+        unconditional_cost = basis.total_fee_lamports - ata_rent
         low = amount_lamports + unconditional_cost - slack
-        high = amount_lamports + report.total_fee_lamports + slack
+        high = amount_lamports + basis.total_fee_lamports + slack
         if sol_spent is None:
             mismatches.append("no post-trade SOL balance to compare against")
         elif not (low <= sol_spent <= high):
@@ -4553,6 +4890,38 @@ class LaneRunner:
                 "window — it is landed but not yet rooted"
             )
 
+        # ---- a LATE reconciliation is held to the transaction's own record ----
+        # See the docstring. Nothing here can turn a mismatch into a pass: the
+        # three checks only ever append.
+        chain_sol_spent: int | None = None
+        chain_usdc_received: int | None = None
+        if after_resolution:
+            if not _is_finalized(confirmation):
+                mismatches.append(
+                    f"the transaction is {confirmation['outcome']} "
+                    f"({confirmation['confirmation_status']}) rather than "
+                    "finalized; nothing is reconciled against a transaction a "
+                    "fork can still undo"
+                )
+            chain_sol_spent, chain_usdc_received, record_problems = (
+                transaction_wallet_deltas(
+                    transaction, owner=signer_pubkey, mint=USDC_MINT
+                )
+            )
+            mismatches.extend(record_problems)
+            for label, measured, recorded in (
+                ("SOL spent (lamports)", sol_spent, chain_sol_spent),
+                ("USDC received (raw)", usdc_received, chain_usdc_received),
+            ):
+                if measured is None or recorded is None or measured == recorded:
+                    continue
+                mismatches.append(
+                    f"{label}: the wallet moved by {measured} since the run "
+                    f"measured it, but this transaction's own record accounts "
+                    f"for {recorded} — something else has moved the wallet, "
+                    "so its balance no longer isolates this swap"
+                )
+
         # ---- the position, and what it cost to open ----
         # A balance delta says money moved. A POSITION record says what the
         # lane now holds, at what price, and how far that landed from the
@@ -4562,12 +4931,18 @@ class LaneRunner:
         pnl = _entry_economics(
             amount_lamports=amount_lamports,
             usdc_received=usdc_received,
-            quoted_out_raw=quote.out_amount,
+            quoted_out_raw=basis.quoted_out_raw,
             fee_lamports=meta_fee,
         )
         ledger = None
         if live_trade_id is not None:
-            if usdc_received is not None and usdc_received > 0:
+            # The run writes its fill even on a review: it measured the wallet
+            # seconds after the trade, and that number is the best one there
+            # will ever be. A late reconciliation that has ALREADY found a
+            # mismatch is the opposite case — its number is suspect by its own
+            # account, and writing it would replace the run's good one.
+            fill_is_trustworthy = not (after_resolution and mismatches)
+            if usdc_received is not None and usdc_received > 0 and fill_is_trustworthy:
                 await update_live_trade(
                     self._db,
                     live_trade_id,
@@ -4629,26 +5004,214 @@ class LaneRunner:
                 "usdc_after_raw": usdc_after,
                 "usdc_received_raw": usdc_received,
                 "usdc_received": _fmt(usdc_from_raw(usdc_received)),
-                "usdc_minimum_raw": quote.min_out_amount,
-                "usdc_minimum": _fmt(usdc_from_raw(quote.min_out_amount)),
-                "usdc_quoted_raw": quote.out_amount,
+                "usdc_minimum_raw": basis.min_out_raw,
+                "usdc_minimum": _fmt(usdc_from_raw(basis.min_out_raw)),
+                "usdc_quoted_raw": basis.quoted_out_raw,
                 # The slippage guarantee, stated rather than implied.
                 "meets_minimum_output": meets_minimum_output,
             },
         }
+        if after_resolution:
+            # Only on the late path, so the run's own record keeps the shape
+            # every existing reader of it expects.
+            summary["after_resolution"] = {
+                "finalized": _is_finalized(confirmation),
+                "transaction_sol_spent_lamports": chain_sol_spent,
+                "transaction_usdc_received_raw": chain_usdc_received,
+            }
         evidence.record("reconciliation", **summary)
         if mismatches:
             log.warning("solana_lane_reconciliation_review", mismatches=mismatches)
         return summary
 
+    async def _reconcile_after_resolution(
+        self,
+        *,
+        evidence: EvidenceLog,
+        decision_id: str,
+        row: dict[str, Any],
+        signature: str,
+        resolution: ResolutionReport,
+    ) -> dict[str, Any]:
+        """Finish a run the cluster now reports FINALIZED. Called by ``resolve``.
+
+        The run is already at ``finalized``. What is left is the step the run
+        itself would have taken next: reconcile, and move to ``reconciled``
+        only if that passes. It is the same ``_reconcile``, fed the same
+        numbers the run was holding — read back from where the run wrote them
+        before the approval prompt — plus the stricter terms a late
+        comparison needs.
+
+        *** NOTHING HERE BUILDS, SIGNS OR SUBMITS ANYTHING. *** There is no
+        quote, no Jupiter call, no key and no block-engine call on this path:
+        the only inputs are the persisted signature, the evidence file and
+        read-only RPC.
+
+        Fails closed at every step. An evidence file that cannot be vouched
+        for, a wallet that is not the one that signed, a transaction record
+        that cannot be read, or any mismatch at all leaves the run at
+        ``finalized`` — which says exactly what is known: rooted, not
+        reconciled.
+        """
+        execution = await load_execution(self._db, decision_id) or {}
+        outcome: dict[str, Any] = {
+            "attempted": False,
+            "verdict": None,
+            "reasons": [],
+            "execution_state": execution.get("state"),
+        }
+        if execution.get("state") != STATE_FINALIZED:
+            # Belt and braces: the caller checks this, and the transition
+            # table would refuse the write anyway.
+            outcome["reasons"] = [
+                f"the execution is {execution.get('state')!r}, not finalized"
+            ]
+            return outcome
+
+        # ---- the money axis has to be able to follow ----
+        # `finalized` and `reconciled` are coherent with exactly one ledger
+        # status: 'open', a held position. Two other things can be there.
+        ledger_status = row.get("status")
+        if ledger_status == "needs_manual_review":
+            # Set by the run when it could not tell whether its transaction
+            # existed. It does, it executed without error and it is rooted —
+            # so "nobody knows" is no longer true and "a position is held" is.
+            # Both statuses block the lane; this changes what the row SAYS,
+            # not whether anything may trade over it. Done before the
+            # comparison so the position check counts this row's claim.
+            await update_live_trade(self._db, int(row["live_trade_id"]), status="open")
+            evidence.record(
+                "ledger_row_restored",
+                live_trade_id=row["live_trade_id"],
+                from_status="needs_manual_review",
+                ledger_status="open",
+                note="the transaction this row was unsure about is finalized "
+                "without error, so the position it describes exists",
+            )
+        elif ledger_status != "open":
+            # The ledger says there is no position; the chain says the swap
+            # executed. That disagreement is about MONEY and it is not this
+            # command's to settle — reconciling here would close the execution
+            # row and, with the ledger row already finished, clear the lane
+            # over a position nothing records.
+            outcome["reasons"] = [
+                f"live_trades #{row['live_trade_id']} is {ledger_status!r}, "
+                "which says no position exists — but this transaction is "
+                "finalized on chain. The two must be squared by hand before "
+                "anything is reconciled."
+            ]
+            evidence.record(
+                "reconciliation_not_attempted",
+                decision_id=decision_id,
+                execution_state=STATE_FINALIZED,
+                reasons=outcome["reasons"],
+                note="ledger and chain disagree about whether a position "
+                "exists; the execution keeps blocking the lane",
+            )
+            return outcome
+
+        basis, signed_by, problems = read_reconciliation_basis(
+            self._settings.SOLANA_PILOT_EVIDENCE_DIR,
+            decision_id,
+            execution=execution,
+            signature=signature,
+        )
+        declared = (self._settings.SOLANA_PILOT_SIGNER_PUBKEY or "").strip()
+        if basis is not None and signed_by != declared:
+            problems = [
+                f"this swap was signed by {signed_by}, but "
+                f"SOLANA_PILOT_SIGNER_PUBKEY now declares {declared or '(none)'} "
+                "— the position check would be made against the wrong wallet"
+            ]
+        if basis is None or problems:
+            outcome["reasons"] = problems
+            evidence.record(
+                "reconciliation_not_attempted",
+                decision_id=decision_id,
+                execution_state=STATE_FINALIZED,
+                reasons=problems,
+                note="the run is finalized, but the numbers it would have been "
+                "reconciled against cannot be vouched for, so no comparison "
+                "was made and nothing was written",
+            )
+            return outcome
+
+        confirmation = {
+            "outcome": "landed_after_resolution",
+            "slot": resolution.slot,
+            "confirmation_status": resolution.confirmation_status,
+        }
+        # Asked for at 'finalized': a second, independent read of the one
+        # fact this whole path rests on, from a different client than the
+        # resolver that reported it. A node that does not have the
+        # transaction rooted answers null, and null fails the comparison.
+        transaction = await self._transaction_record(
+            evidence, signature, commitment="finalized"
+        )
+        summary = await self._reconcile(
+            evidence=evidence,
+            live_trade_id=row["live_trade_id"],
+            decision_id=decision_id,
+            signature=signature,
+            basis=basis,
+            signer_pubkey=str(signed_by),
+            confirmation=confirmation,
+            transaction=transaction,
+            after_resolution=True,
+        )
+        outcome.update(
+            attempted=True,
+            verdict=summary["verdict"],
+            reasons=list(summary["mismatches"]),
+            summary=summary,
+        )
+        if summary["verdict"] != "pass":
+            return outcome
+
+        # The row carries the mode it ran under; that is what the supervised
+        # history count reads, and today's config is not evidence about it.
+        await record_execution_state(
+            self._db,
+            decision_id,
+            STATE_RECONCILED,
+            mode=execution["mode"] or self._settings.SOLANA_MODE,
+            detail={"reconciliation": "pass", "reconciled_by": "resolve"},
+        )
+        outcome["execution_state"] = STATE_RECONCILED
+        evidence.record(
+            "reconciled_after_resolution",
+            decision_id=decision_id,
+            live_trade_id=row["live_trade_id"],
+            execution_state=STATE_RECONCILED,
+            signature=signature,
+            slot=resolution.slot,
+            note="reconciled against a FINALIZED transaction whose own record "
+            "accounts exactly for the wallet's movement; the ledger row stays "
+            "open because the position is real",
+        )
+        return outcome
+
     # ---------------- resolve ----------------
     async def resolve(self, *, decision_id: str) -> int:
         """Put one persisted signature to the cluster and report the verdict.
 
-        Read-only except for the one safe mutation: a
-        ``definitively_not_submitted`` verdict retires the row, because that
-        verdict means the transaction can never land and the lane is genuinely
-        clear. Every other verdict leaves the row exactly as it is.
+        Never builds, signs or submits. What it may WRITE is decided by the
+        verdict, and each write only records something the cluster has
+        already made true:
+
+        ``definitively_not_submitted`` / ``failed_on_chain``
+            Final. The ledger row is retired and the execution row ended.
+        ``landed``, not yet finalized
+            The execution row moves to ``landed`` and stops. A fork can still
+            undo the transaction, so nothing is reconciled against it.
+        ``landed`` and finalized
+            The execution row moves to ``finalized``, and then the
+            reconciliation the run itself would have done next is done here
+            (``_reconcile_after_resolution``). Only a pass reaches
+            ``reconciled``; anything else leaves it at ``finalized``. The
+            ledger row stays ``open`` either way — the position is real.
+        ``unresolved``
+            Nothing is written.
 
         Deliberately NOT gated on the kill switch or on SOLANA_MODE.
         Turning the master gate off is an operator's instinctive first move
@@ -4738,6 +5301,8 @@ class LaneRunner:
             retired = False
             withheld = False
             execution_state = None
+            # Set only when a finalized landing went on to reconciliation.
+            late: dict[str, Any] | None = None
             definitive = lane.verdict in (
                 "definitively_not_submitted",
                 "failed_on_chain",
@@ -4788,14 +5353,45 @@ class LaneRunner:
                     "ledger row nor the execution row is advanced on it",
                 )
             elif lane.verdict == "landed":
-                # Not terminal — a position exists and the lane SHOULD keep
-                # blocking. Advancing off `submission_attempted` is still worth
-                # doing: it is what actually happened, and it moves the row onto
-                # the watchdog's post-submission threshold instead of the
-                # three-minute submission one.
+                # A position exists. How far the execution row may move depends
+                # on ONE thing: whether the cluster reports the transaction
+                # rooted.
+                #
+                #   not finalized -> `landed`. It is what actually happened, and
+                #                    it moves the row onto the watchdog's
+                #                    post-submission threshold. Nothing is
+                #                    reconciled against it: a fork can still
+                #                    undo it, which is exactly why the table has
+                #                    no `landed -> reconciled`.
+                #   finalized     -> `finalized`, and then the reconciliation
+                #                    the run itself would have done next.
+                #
+                # Without the second arm a run that was seen but not rooted
+                # inside its window had no way forward at all: this command
+                # targeted `landed`, which `landed` cannot reach, and the row
+                # was edited by hand.
+                finalized = resolution.confirmation_status == "finalized"
                 execution_state = await self._terminalize_execution(
-                    decision_id, reason="resolve:landed", target=STATE_LANDED
+                    decision_id,
+                    reason="resolve:landed",
+                    target=STATE_FINALIZED if finalized else STATE_LANDED,
                 )
+                evidence.record(
+                    "landed",
+                    live_trade_id=row["live_trade_id"],
+                    execution_state=execution_state,
+                    confirmation_status=resolution.confirmation_status,
+                    slot=resolution.slot,
+                )
+                if finalized and execution_state == STATE_FINALIZED:
+                    late = await self._reconcile_after_resolution(
+                        evidence=evidence,
+                        decision_id=decision_id,
+                        row=row,
+                        signature=str(signature),
+                        resolution=resolution,
+                    )
+                    execution_state = late["execution_state"]
 
             lines = [
                 f"  decision ID : {decision_id}",
@@ -4842,6 +5438,14 @@ class LaneRunner:
             lines.extend(
                 _verdict_guidance(lane.verdict, retired, lane_is_clear=lane_is_clear)
             )
+            if lane.verdict == "landed" and execution_state is not None:
+                lines.extend(
+                    _landed_execution_guidance(
+                        execution_state,
+                        confirmation_status=resolution.confirmation_status,
+                        late=late,
+                    )
+                )
             if lane.reason == "history_window_exceeded":
                 lines.extend(
                     [
@@ -4867,6 +5471,14 @@ class LaneRunner:
                 )
             _print_block("SOLANA LANE RESOLUTION", lines)
             if lane.verdict == "landed":
+                # A finalized swap that would not reconcile is the same fact
+                # `place` reports as EXIT_REVIEW, so it gets the same code.
+                # Everything else about a landing still BLOCKS — including a
+                # clean reconciliation, because the position it proves is held
+                # and `place` will refuse on the ledger row until it is
+                # disposed of.
+                if late is not None and late["execution_state"] != STATE_RECONCILED:
+                    return EXIT_REVIEW
                 return EXIT_BLOCKED
             if lane.verdict == "definitively_not_submitted":
                 # EXIT_OK means "the lane is clear, go again", so it is owed to
@@ -7300,6 +7912,55 @@ def _is_finalized(confirmation: dict[str, Any]) -> bool:
     return (
         outcome == "landed_after_resolution"
         and confirmation.get("confirmation_status") == "finalized"
+    )
+
+
+def _landed_execution_guidance(
+    execution_state: str,
+    *,
+    confirmation_status: str | None,
+    late: dict[str, Any] | None,
+) -> list[str]:
+    """What ``resolve`` did to the EXECUTION row of a landed swap, and why.
+
+    Separate from ``_verdict_guidance`` because that speaks for the ledger row
+    — the position — and is true of every landing. This speaks for the
+    lifecycle axis, which is the one this command may now move.
+    """
+    if late is None:
+        if confirmation_status == "finalized":
+            # Finalized, but the row could not be moved there (it is terminal
+            # already, or its state cannot legally reach `finalized`).
+            return ["", f"  The execution row was left at {execution_state}."]
+        return [
+            "",
+            f"  The transaction is NOT finalized yet (the cluster says "
+            f"{confirmation_status or 'nothing about its commitment'}). A fork",
+            "  can still undo it, so nothing was reconciled against it and the",
+            f"  execution stays at {execution_state}. Run this command again",
+            "  once it is rooted; that is the only thing it is waiting for.",
+        ]
+    if late["execution_state"] == STATE_RECONCILED:
+        return [
+            "",
+            "  The transaction is FINALIZED and the run is now RECONCILED: the",
+            "  transaction's own record accounts exactly for what the wallet",
+            "  moved by. The execution row is closed. The LEDGER row is not —",
+            "  it stays open, and keeps blocking `place`, for as long as you",
+            "  hold the position.",
+        ]
+    return (
+        [
+            "",
+            "  The transaction is FINALIZED but the run did NOT reconcile, so",
+            f"  the execution stays at {late['execution_state']}:",
+        ]
+        + [f"   - {reason}" for reason in late["reasons"]]
+        + [
+            "  Nothing was built or sent, and nothing will be: check the wallet",
+            "  against the evidence file. Running this command again repeats",
+            "  the comparison and changes nothing unless it then agrees.",
+        ]
     )
 
 

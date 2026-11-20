@@ -340,8 +340,9 @@ For `place`:
 | Code | Verdict | Meaning |
 |---|---|---|
 | 0 | `definitively_not_submitted` | Can never land. Row retired, lane clear, a fresh `place` is safe. |
-| 2 | `landed` or `failed_on_chain` | Terminal but needs your disposition — a position to close, or a paid fee to record. The row stays. |
+| 2 | `landed` or `failed_on_chain` | Needs your disposition — a position to close, or a paid fee to record. The ledger row stays. For `landed`, read the `execution` line: `landed` means not yet finalized (run it again), `reconciled` means the run is finished and only the position is left. |
 | 3 | `unresolved` | Still unknown. Run it again later. Do not rebuild. |
+| 4 | `landed`, finalized, **not reconciled** | The swap is rooted but the comparison did not agree, or could not be made. The execution stays at `finalized` and keeps blocking. Read the reasons it prints. |
 
 `status` exits 0 whatever it finds; read its output, not its code.
 
@@ -367,7 +368,54 @@ python -m scout.live.solana_lane resolve --decision-id <uuid>
 Once the verdict becomes `definitively_not_submitted` — absent from the cluster
 AND past `lastValidBlockHeight`, so it can never land — the row is retired
 automatically and the lane clears. If it comes back `landed`, you hold USDC:
-dispose of it and resolve the row by hand. Escalate either way.
+`resolve` finishes the execution row once the transaction is finalized (next
+section), and the position is yours to dispose of. Escalate either way.
+
+### A swap that landed but was not finalized in time
+
+`place` waits a bounded time for finality. A swap that was seen on the cluster
+but not rooted inside that window ends with exit 4 (`LANE SWAP
+FINALIZE_TIMEOUT`) and the execution at `landed`; one the confirmation poll
+never saw, which the resolver then found, ends with exit 3 and the execution at
+`submission_attempted`. Either way the lane blocks, correctly: a fork can still
+undo the transaction, and nothing is reconciled against that.
+
+The way out is the same command, and it never builds or sends anything:
+
+```bash
+python -m scout.live.solana_lane resolve --decision-id <uuid>
+```
+
+| `execution` line | What happened | What to do |
+|---|---|---|
+| `landed` | The cluster still reports `confirmed`/`processed`. Nothing was reconciled. | Run it again shortly. Finality normally follows within seconds. |
+| `reconciled` | Finalized, and reconciled. The execution row is closed. | Nothing for the execution. The ledger row stays `open` and blocks `place` until you dispose of the position. |
+| `finalized` (exit 4) | Finalized, but not reconciled. The reasons are printed. | See below. Do **not** edit `solana_executions` to get past it. |
+
+A reconciliation run after the fact is held to stricter terms than the one
+`place` runs, because it is no longer comparing balances seconds after the
+trade. On top of every check `place` makes:
+
+- the transaction record is fetched at `finalized` commitment, and the wallet's
+  SOL and USDC movement since the run measured it must equal **exactly** what
+  that record's own pre/post balances say the transaction did. A wallet that was
+  topped up, swept, or traded from elsewhere in the meantime no longer isolates
+  the swap and will not reconcile;
+- the numbers it compares against (quote, fee total, pre-trade balances) are
+  read back from the decision's evidence file and must agree with the
+  `solana_executions` row on amount, minimum output, message hash and
+  signature. A missing or disagreeing file means no comparison is attempted;
+- the wallet that signed must still be `SOLANA_PILOT_SIGNER_PUBKEY`;
+- the ledger row must be `open` (a `needs_manual_review` row is restored to
+  `open` first, since a finalized landing settles what it was unsure about). A
+  row that is `rejected` while the chain says the swap executed is never
+  reconciled — that is a ledger/chain disagreement about money, and it is
+  yours to square.
+
+If it stops at `finalized`, the transaction is real and rooted; what is missing
+is an accounting anyone can vouch for. Check the wallet against the evidence
+file. Running `resolve` again repeats the comparison and changes nothing unless
+it then agrees — for example once funds moved in by mistake are moved back out.
 
 ### 2. A stale blockhash invalidates the authorization by design
 

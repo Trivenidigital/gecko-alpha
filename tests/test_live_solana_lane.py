@@ -4103,6 +4103,915 @@ async def test_resolve_leaves_a_landed_row_alone(tmp_path):
     await db.close()
 
 
+# ----------------------------------------------------------------------
+# resolve: the way out of `landed`
+# ----------------------------------------------------------------------
+# A run that was seen on the cluster but not ROOTED inside the window is left
+# blocking the lane, correctly. These pin down that `resolve` can carry it the
+# rest of the way once the cluster reports finality — and ONLY then.
+async def _run_into_unrooted(tmp_path, monkeypatch, *, via: str):
+    """Drive a real ``place`` to a swap that executed but was never seen rooted.
+
+    A real run rather than seeded rows, because what ``resolve`` later reads
+    back — the quote, the fee total, the balances measured before the swap — is
+    whatever the run itself made durable. A fixture that wrote those by hand
+    would agree with the reader by construction.
+
+    ``via`` picks which of the two ways a run gets here:
+
+    ``finalize_timeout``  the confirmation poll saw the transaction at
+                          'confirmed' and the finalize window closed first.
+    ``adopted``           the poll never saw it; the resolver found it landed,
+                          at 'confirmed', and the run adopted it.
+
+    The confirmation poll is patched on the runner's own RPC client because it
+    is a wall-clock loop: the number of polls is not knowable, and a mock that
+    repeats would swallow every RPC registered after it. The resolver pool has
+    its own client, so this does not touch what a resolution reads.
+    """
+    from scout.live.solana.rpc_client import SignatureStatus
+
+    tx = build_swap_tx().tx_b64
+    _authorize(monkeypatch, _phrase(tx))
+    runner, db, session = await _make_runner(tmp_path)
+
+    async def _poll(_sigs, **_kw):
+        if via == "finalize_timeout":
+            return [
+                SignatureStatus(
+                    known=True,
+                    slot=283_000_455,
+                    err=None,
+                    confirmation_status="confirmed",
+                )
+            ]
+        return [SignatureStatus(known=False)]
+
+    runner._rpc.get_signature_statuses = _poll
+    with aioresponses() as m:
+        _mock_quote_and_build(m, tx)
+        _mock_pre_approval_rpc(m)
+        _mock_post_approval_rpc(m)
+        m.post(_SUBMIT_RE, payload=_rpc(_expected_signature(tx)))
+        if via == "adopted":
+            # The in-run resolution: one sweep, then the balances it records as
+            # supplementary evidence.
+            m.post(_RPC_URL, payload=_sig_status(status="confirmed"))
+            m.post(
+                _RPC_URL, payload=_rpc({"context": {"slot": 1}, "value": _SOL_AFTER})
+            )
+            m.post(_RPC_URL, payload=_token_accounts(0))
+            m.post(_RPC_URL, payload=_token_accounts(_OUT_RAW))
+        # getTransaction, then the post-trade balances — which AGREE. Nothing
+        # is wrong with this swap except that it is not rooted yet.
+        m.post(
+            _RPC_URL,
+            payload=_rpc({"slot": 283_000_455, "meta": {"fee": _TX_FEES, "err": None}}),
+        )
+        m.post(_RPC_URL, payload=_rpc({"context": {"slot": 1}, "value": _SOL_AFTER}))
+        m.post(_RPC_URL, payload=_token_accounts(_OUT_RAW))
+        code = await runner.place(sol=_SOL)
+        assert len(_submissions(m)) == 1
+    decision_id = _step(_steps(tmp_path), "run_started")["decision_id"]
+    return code, runner, db, session, decision_id, _expected_signature(tx)
+
+
+def _chain_record(
+    *,
+    sol_spent: int = _LAMPORTS + _TX_FEES,
+    usdc_received: int = _OUT_RAW,
+    usdc_before: int = 0,
+    owner: str = PAYER_PUBKEY,
+) -> dict:
+    """A ``getTransaction`` result shaped as a node returns it (jsonParsed).
+
+    Carries the pre/post balance arrays, which is what a late reconciliation
+    is held to: they are the transaction's own statement of what it did to the
+    wallet, and unlike the wallet's balance they do not change afterwards.
+    """
+    ata = "7UX2i7SucgLMQcfZ75s3VXmZZY4YRUyJN9X1RgfMoDUi"
+
+    def _token(amount: int) -> dict:
+        return {
+            "accountIndex": 1,
+            "mint": USDC_MINT,
+            "owner": owner,
+            "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            "uiTokenAmount": {"amount": str(amount), "decimals": 6},
+        }
+
+    return {
+        "slot": 283_000_455,
+        "transaction": {
+            "message": {
+                "accountKeys": [
+                    {"pubkey": PAYER_PUBKEY, "signer": True, "writable": True},
+                    {"pubkey": ata, "signer": False, "writable": True},
+                ]
+            }
+        },
+        "meta": {
+            "fee": _TX_FEES,
+            "err": None,
+            "preBalances": [_SOL_BEFORE, 0],
+            "postBalances": [_SOL_BEFORE - sol_spent, _ATA_RENT],
+            # No entry before the swap when the wallet held no USDC: the
+            # account did not exist yet.
+            "preTokenBalances": [_token(usdc_before)] if usdc_before else [],
+            "postTokenBalances": [_token(usdc_before + usdc_received)],
+        },
+    }
+
+
+_NO_RECONCILIATION = object()
+
+
+def _mock_resolve_rpc(
+    m: aioresponses,
+    *,
+    status: str,
+    record=None,
+    sol_after: int = _SOL_AFTER,
+    usdc_after: int = _OUT_RAW,
+) -> None:
+    """What ``resolve`` reads: pool admission, one sweep, then — only if it goes
+    on to reconcile — the transaction record and the wallet's balances.
+
+    ``record=_NO_RECONCILIATION`` registers nothing past the sweep, so a test
+    asserting that reconciliation was NOT attempted fails loudly on an unmocked
+    call rather than passing on a read it should never have made.
+    """
+    _mock_resolver_pool_rpc(m)
+    m.post(_RPC_URL, payload=_sig_status(status=status))
+    if record is _NO_RECONCILIATION:
+        return
+    m.post(_RPC_URL, payload=_rpc(_chain_record() if record is None else record))
+    m.post(_RPC_URL, payload=_rpc({"context": {"slot": 1}, "value": sol_after}))
+    m.post(_RPC_URL, payload=_token_accounts(usdc_after))
+
+
+def _rpc_calls(m: aioresponses) -> int:
+    return len(_posts_to(m, _RPC_URL))
+
+
+def _last_run(tmp_path, decision_id: str) -> list[dict]:
+    """Evidence steps written by the most recent command on this decision."""
+    steps = [
+        json.loads(line)
+        for line in _evidence_path(tmp_path, decision_id)
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    return steps[max(i for i, s in enumerate(steps) if s["step"] == "run_started") :]
+
+
+def _rewrite_evidence(tmp_path, decision_id: str, mutate) -> None:
+    """Apply ``mutate(entry) -> entry | None`` to every evidence record.
+
+    Returning None drops the record. Stands in for a file that was truncated,
+    copied from another run, or edited.
+    """
+    path = _evidence_path(tmp_path, decision_id)
+    kept = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        entry = mutate(json.loads(line))
+        if entry is not None:
+            kept.append(json.dumps(entry))
+    path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("via", ["finalize_timeout", "adopted"])
+async def test_resolve_carries_an_unrooted_run_to_reconciled_once_it_is_finalized(
+    tmp_path, monkeypatch, capsys, via
+):
+    """*** The way out. ***
+
+    Before this, nothing could move such a run: `resolve` targeted `landed`,
+    which `landed` cannot legally reach, and the operator edited the table by
+    hand. Now a resolver answer of `finalized` advances it to `finalized`, and
+    the SAME reconciliation the run would have done takes it to `reconciled`.
+    """
+    code, runner, db, session, decision_id, signature = await _run_into_unrooted(
+        tmp_path, monkeypatch, via=via
+    )
+    # The run did not reconcile, and it blocks the lane. The two routes leave
+    # different states behind, and `resolve` has to take either.
+    assert code == (EXIT_REVIEW if via == "finalize_timeout" else EXIT_ESCALATE)
+    before = await solana_lane.load_execution(db, decision_id)
+    assert before["state"] == (
+        "landed" if via == "finalize_timeout" else "submission_attempted"
+    )
+    assert (await runner._recover_interrupted_executions())["blockers"] == 1
+    capsys.readouterr()
+
+    with aioresponses() as m:
+        _mock_resolve_rpc(m, status="finalized")
+        assert await runner.resolve(decision_id=decision_id) == EXIT_BLOCKED
+        # NOTHING was built and nothing was sent — `resolve` only ever reads.
+        assert _submissions(m) == []
+        assert _posts_to(m, _SWAP_URL) == []
+        assert _posts_to(m, _QUOTE_RE) == []
+        # The transaction record is asked for at 'finalized': a second read of
+        # the one fact this path rests on, from a different client.
+        get_transaction = [
+            call.kwargs["json"]
+            for call in _posts_to(m, _RPC_URL)
+            if call.kwargs["json"]["method"] == "getTransaction"
+        ]
+        assert [c["params"][1]["commitment"] for c in get_transaction] == ["finalized"]
+    # The funded key was not read again: there is nothing here to sign.
+    assert runner.loader_spy.calls == 1
+
+    execution = await solana_lane.load_execution(db, decision_id)
+    assert execution["state"] == "reconciled"
+    assert execution["detail"] == {"reconciliation": "pass", "reconciled_by": "resolve"}
+    # Earlier facts survive the two transitions: the mode the run was made
+    # under (it is what the supervised-history count reads) and its signature.
+    assert execution["mode"] == "SUPERVISED_LIVE"
+    assert execution["expected_signature"] == signature
+    assert (await runner._recover_interrupted_executions())["blockers"] == 0
+    assert await solana_lane.find_incoherent_executions(db) == []
+    assert await solana_lane.count_supervised_reconciled(db) == 1
+
+    steps = _last_run(tmp_path, decision_id)
+    assert steps[0]["command"] == "resolve"
+    landed = _step(steps, "landed")
+    assert landed["execution_state"] == "finalized"
+    assert landed["confirmation_status"] == "finalized"
+    reconciliation = _step(steps, "reconciliation")
+    assert reconciliation["verdict"] == "pass"
+    assert reconciliation["chain"]["confirmation_status"] == "finalized"
+    assert reconciliation["balance"]["usdc_received_raw"] == _OUT_RAW
+    assert reconciliation["balance"]["meets_minimum_output"] is True
+    assert reconciliation["after_resolution"] == {
+        "finalized": True,
+        "transaction_sol_spent_lamports": _LAMPORTS + _TX_FEES,
+        "transaction_usdc_received_raw": _OUT_RAW,
+    }
+    assert _step(steps, "reconciled_after_resolution")["execution_state"] == (
+        "reconciled"
+    )
+
+    # The position is real and still the operator's to dispose of: the money
+    # axis keeps blocking, and the message must not say otherwise.
+    row = await _row(db, decision_id)
+    assert row["status"] == "open"
+    assert row["entry_order_id"] == signature
+    assert row["entry_fill_qty"] == "0.05"
+    out = capsys.readouterr().out
+    assert "execution   : reconciled" in out
+    assert "now RECONCILED" in out
+    assert "Rerunning `place` is safe" not in out
+    await session.close()
+    await db.close()
+
+
+@pytest.mark.parametrize("via", ["finalize_timeout", "adopted"])
+async def test_resolve_leaves_a_run_that_is_still_only_confirmed_where_it_is(
+    tmp_path, monkeypatch, capsys, via
+):
+    """A fork can still undo 'confirmed'. Nothing is reconciled against it.
+
+    Run TWICE, because that is how it is used: an operator repeats the command
+    until the transaction is rooted. The second run finds the row already at
+    `landed`, and that must be a quiet no-op rather than a refused transition.
+    """
+    _code, runner, db, session, decision_id, _sig = await _run_into_unrooted(
+        tmp_path, monkeypatch, via=via
+    )
+    fill_before = (await _row(db, decision_id))["entry_fill_price"]
+    capsys.readouterr()
+
+    for _attempt in range(2):
+        with aioresponses() as m:
+            # No transaction record and no balances are registered:
+            # reconciliation must not even be attempted.
+            _mock_resolve_rpc(m, status="confirmed", record=_NO_RECONCILIATION)
+            assert await runner.resolve(decision_id=decision_id) == EXIT_BLOCKED
+            assert _rpc_calls(m) == 3  # genesis, health, one sweep — and no more
+            assert _submissions(m) == []
+
+        execution = await solana_lane.load_execution(db, decision_id)
+        assert execution["state"] == "landed"
+        assert (await runner._recover_interrupted_executions())["blockers"] == 1
+        steps = _last_run(tmp_path, decision_id)
+        assert _step(steps, "landed")["execution_state"] == "landed"
+        assert _step(steps, "landed")["confirmation_status"] == "confirmed"
+        assert _step(steps, "reconciliation") is None
+        assert _step(steps, "transaction_record") is None
+        out = capsys.readouterr().out
+        assert "execution   : landed" in out
+        assert "NOT finalized yet" in out
+        assert "solana_lane_terminalize_refused" not in out
+
+    assert (await _row(db, decision_id))["entry_fill_price"] == fill_before
+    assert (await _row(db, decision_id))["status"] == "open"
+    await session.close()
+    await db.close()
+
+
+async def test_a_wallet_that_moved_since_the_swap_does_not_reconcile_late(
+    tmp_path, monkeypatch, capsys
+):
+    """*** The stale-balance hazard, which only a LATE reconciliation has. ***
+
+    The run compares balances seconds after the trade. `resolve` may run hours
+    later, and by then the wallet can hold USDC this swap never bought. That
+    balance still clears the on-chain minimum — it is MORE than expected — so
+    the run's own checks would pass it and write an inflated fill into the
+    ledger, which is the number a later exit is sized against.
+
+    The transaction's own record does not age. A late reconciliation must
+    match it exactly, and here it does not.
+    """
+    _code, runner, db, session, decision_id, _sig = await _run_into_unrooted(
+        tmp_path, monkeypatch, via="finalize_timeout"
+    )
+    fill_before = (await _row(db, decision_id))["entry_fill_price"]
+    assert Decimal(fill_before) == Decimal("8.528730") / Decimal("0.05")
+    capsys.readouterr()
+
+    topped_up = _OUT_RAW + 100_000_000  # 100 USDC arrived from somewhere else
+    with aioresponses() as m:
+        _mock_resolve_rpc(m, status="finalized", usdc_after=topped_up)
+        assert await runner.resolve(decision_id=decision_id) == EXIT_REVIEW
+
+    # Rooted — that much is true and is recorded — but NOT reconciled.
+    execution = await solana_lane.load_execution(db, decision_id)
+    assert execution["state"] == "finalized"
+    assert (await runner._recover_interrupted_executions())["blockers"] == 1
+    assert await solana_lane.count_supervised_reconciled(db) == 0
+    reconciliation = _step(_last_run(tmp_path, decision_id), "reconciliation")
+    assert reconciliation["verdict"] == "review"
+    # Every check the run itself makes was satisfied; only the late one bit.
+    assert reconciliation["balance"]["meets_minimum_output"] is True
+    assert len(reconciliation["mismatches"]) == 1
+    assert "something else has moved the wallet" in reconciliation["mismatches"][0]
+    # And the suspect number never reached the ledger.
+    assert (await _row(db, decision_id))["entry_fill_price"] == fill_before
+    out = capsys.readouterr().out
+    assert "did NOT reconcile" in out
+    assert "execution   : finalized" in out
+
+    # Not a dead end: once the wallet again isolates the swap, the SAME
+    # command finishes the job from `finalized`.
+    with aioresponses() as m:
+        _mock_resolve_rpc(m, status="finalized")
+        assert await runner.resolve(decision_id=decision_id) == EXIT_BLOCKED
+    assert (await solana_lane.load_execution(db, decision_id))["state"] == "reconciled"
+    await session.close()
+    await db.close()
+
+
+@pytest.mark.parametrize(
+    "record, fragment",
+    [
+        (None, "no transaction record was returned"),
+        (
+            {"slot": 283_000_455, "meta": {"fee": _TX_FEES, "err": None}},
+            "carries no readable token balances",
+        ),
+        (
+            # The record of some OTHER wallet's transaction.
+            "stranger",
+            "the wallet is not among the transaction's account keys",
+        ),
+    ],
+)
+async def test_late_reconciliation_fails_closed_without_the_transactions_own_record(
+    tmp_path, monkeypatch, record, fragment
+):
+    """A missing record is not a matching one.
+
+    The wallet's balances are exactly right in every case here. They are not
+    enough on their own once the comparison is late — and `null` is also what
+    a node answers, at 'finalized', for a transaction it does not have rooted.
+    """
+    _code, runner, db, session, decision_id, _sig = await _run_into_unrooted(
+        tmp_path, monkeypatch, via="finalize_timeout"
+    )
+    if record == "stranger":
+        record = _chain_record()
+        record["transaction"]["message"]["accountKeys"][0]["pubkey"] = STRANGER
+    with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
+        m.post(_RPC_URL, payload=_sig_status(status="finalized"))
+        m.post(_RPC_URL, payload=_rpc(record))
+        m.post(_RPC_URL, payload=_rpc({"context": {"slot": 1}, "value": _SOL_AFTER}))
+        m.post(_RPC_URL, payload=_token_accounts(_OUT_RAW))
+        assert await runner.resolve(decision_id=decision_id) == EXIT_REVIEW
+
+    assert (await solana_lane.load_execution(db, decision_id))["state"] == "finalized"
+    reconciliation = _step(_last_run(tmp_path, decision_id), "reconciliation")
+    assert reconciliation["verdict"] == "review"
+    assert any(fragment in m for m in reconciliation["mismatches"])
+    await session.close()
+    await db.close()
+
+
+@pytest.mark.parametrize(
+    "damage, fragment",
+    [
+        ("missing_file", "carries no 'intent_persisted' record"),
+        ("no_balance", "carries no 'balance' record"),
+        ("other_amount", "the swap amount disagrees"),
+        ("other_minimum", "the on-chain minimum output disagrees"),
+        ("other_signature", "records a different signature"),
+        ("other_hash", "the message hash disagrees"),
+        ("not_an_integer", "not a non-negative integer"),
+        ("no_hash", "'intent_persisted'.message_sha256 is None, not a string"),
+        ("no_signer", "'signed_in_memory'.signer_pubkey is None, not a string"),
+    ],
+)
+async def test_an_evidence_file_that_cannot_be_vouched_for_is_not_reconciled_against(
+    tmp_path, monkeypatch, capsys, damage, fragment
+):
+    """The numbers come from a FILE, so nothing in it is taken on its own word.
+
+    Whatever the file says about the swap must match what the database row
+    says about it. When it does not — or the file is gone — the run still
+    advances to `finalized`, because that is a fact about the chain, and stops
+    there: no comparison is made, nothing is read from the wallet, and nothing
+    is written to the ledger.
+    """
+    _code, runner, db, session, decision_id, _sig = await _run_into_unrooted(
+        tmp_path, monkeypatch, via="finalize_timeout"
+    )
+    fill_before = (await _row(db, decision_id))["entry_fill_price"]
+
+    def _mutate(entry):
+        step = entry["step"]
+        if damage == "no_balance" and step == "balance":
+            return None
+        if damage == "other_amount" and step == "intent_persisted":
+            entry["amount_lamports"] = _LAMPORTS - 1
+        if damage == "other_minimum" and step == "quote":
+            entry["min_out_amount_raw"] = 1
+        if damage == "other_signature" and step == "signed_in_memory":
+            entry["expected_signature"] = "5" * 88
+        if damage == "other_hash" and step == "intent_persisted":
+            entry["message_sha256"] = "0" * 64
+        if damage == "not_an_integer" and step == "balance":
+            entry["usdc_balance_raw"] = True
+        if damage == "no_hash" and step == "intent_persisted":
+            # Absent is not "agrees": with the file silent, only the row would
+            # be speaking, and nothing would tie the file to this run.
+            del entry["message_sha256"]
+        if damage == "no_signer" and step == "signed_in_memory":
+            del entry["signer_pubkey"]
+        return entry
+
+    if damage == "missing_file":
+        _evidence_path(tmp_path, decision_id).unlink()
+    else:
+        _rewrite_evidence(tmp_path, decision_id, _mutate)
+    capsys.readouterr()
+
+    with aioresponses() as m:
+        _mock_resolve_rpc(m, status="finalized", record=_NO_RECONCILIATION)
+        assert await runner.resolve(decision_id=decision_id) == EXIT_REVIEW
+        assert _rpc_calls(m) == 3  # the wallet was never even read
+
+    assert (await solana_lane.load_execution(db, decision_id))["state"] == "finalized"
+    assert (await runner._recover_interrupted_executions())["blockers"] == 1
+    steps = _last_run(tmp_path, decision_id)
+    assert _step(steps, "reconciliation") is None
+    refused = _step(steps, "reconciliation_not_attempted")
+    assert any(fragment in reason for reason in refused["reasons"]), refused
+    assert (await _row(db, decision_id))["entry_fill_price"] == fill_before
+    assert fragment in capsys.readouterr().out
+    await session.close()
+    await db.close()
+
+
+async def test_a_changed_declared_signer_stops_a_late_reconciliation(
+    tmp_path, monkeypatch
+):
+    """The wallet that signed is the wallet whose position is being checked."""
+    _code, _runner, db, session, decision_id, _sig = await _run_into_unrooted(
+        tmp_path, monkeypatch, via="finalize_timeout"
+    )
+    await session.close()
+    runner2, db2, session2 = await _make_runner(
+        tmp_path, SOLANA_PILOT_SIGNER_PUBKEY=str(OTHER.pubkey())
+    )
+    with aioresponses() as m:
+        _mock_resolve_rpc(m, status="finalized", record=_NO_RECONCILIATION)
+        assert await runner2.resolve(decision_id=decision_id) == EXIT_REVIEW
+    assert (await solana_lane.load_execution(db2, decision_id))["state"] == "finalized"
+    refused = _step(_last_run(tmp_path, decision_id), "reconciliation_not_attempted")
+    assert "now declares" in refused["reasons"][0]
+    await session2.close()
+    await db2.close()
+    await db.close()
+
+
+async def test_resolve_reconciles_a_run_whose_submission_was_never_resolved(
+    tmp_path, monkeypatch, capsys
+):
+    """`submission_unknown` is the third state a finalized landing can find.
+
+    The run could not tell whether its transaction existed, so it marked the
+    ledger row for a human. Finality settles that question — and the ledger
+    has to say so before `reconciled` is coherent, because a reconciled swap
+    is a HELD POSITION and 'needs_manual_review' is not that.
+    """
+    code, db, session, tx, submissions = await _run_ambiguous(
+        tmp_path,
+        monkeypatch,
+        resolver_payloads=[
+            _sig_status(known=False),
+            _rpc(_HEIGHT_FRESH),  # still landable — absence proves nothing
+            _rpc({"context": {"slot": 1}, "value": _SOL_BEFORE}),
+            _token_accounts(0),
+            _token_accounts(0),
+        ],
+    )
+    assert code == EXIT_ESCALATE
+    assert len(submissions) == 1
+    decision_id = _step(_steps(tmp_path), "run_started")["decision_id"]
+    assert (await solana_lane.load_execution(db, decision_id))["state"] == (
+        "submission_unknown"
+    )
+    assert (await _row(db, decision_id))["status"] == "needs_manual_review"
+    await session.close()
+    capsys.readouterr()
+
+    runner2, db2, session2 = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        _mock_resolve_rpc(m, status="finalized")
+        assert await runner2.resolve(decision_id=decision_id) == EXIT_BLOCKED
+        assert _submissions(m) == []
+        assert _posts_to(m, _SWAP_URL) == []
+    assert runner2.loader_spy.calls == 0
+
+    assert (await solana_lane.load_execution(db2, decision_id))["state"] == "reconciled"
+    row = await _row(db2, decision_id)
+    assert row["status"] == "open"
+    assert row["entry_order_id"] == _expected_signature(tx)
+    assert row["entry_fill_qty"] == "0.05"
+    assert await solana_lane.find_incoherent_executions(db2) == []
+    steps = _last_run(tmp_path, decision_id)
+    assert _step(steps, "ledger_row_restored")["from_status"] == "needs_manual_review"
+    # The position check counted THIS row's claim, which it can only do once
+    # the row is open.
+    assert _step(steps, "reconciliation")["position"]["open_rows"] == 1
+    # Still blocked, on the money axis: a fresh `place` refuses on the open row.
+    assert solana_lane.lane_is_blocked_by("reconciled", row["status"]) is not None
+    await session2.close()
+    await db2.close()
+    await db.close()
+
+
+async def test_a_finalized_swap_the_ledger_calls_rejected_is_never_reconciled(
+    tmp_path, monkeypatch, capsys
+):
+    """*** The one place reconciling would CLEAR the lane, and must not. ***
+
+    Ledger row finished, execution row still open, and the chain says the swap
+    executed. Reaching `reconciled` here would end the execution row while the
+    ledger row is already terminal — both axes clear, `place` runs, and the
+    wallet holds a position no row records. So the execution stops at
+    `finalized`, which keeps blocking, and a human squares the two.
+    """
+    _code, runner, db, session, decision_id, _sig = await _run_into_unrooted(
+        tmp_path, monkeypatch, via="finalize_timeout"
+    )
+    await solana_lane.retire_row(db, (await _row(db, decision_id))["live_trade_id"])
+    capsys.readouterr()
+
+    with aioresponses() as m:
+        _mock_resolve_rpc(m, status="finalized", record=_NO_RECONCILIATION)
+        assert await runner.resolve(decision_id=decision_id) == EXIT_REVIEW
+        assert _rpc_calls(m) == 3
+
+    assert (await solana_lane.load_execution(db, decision_id))["state"] == "finalized"
+    assert (await runner._recover_interrupted_executions())["blockers"] == 1
+    assert (await _row(db, decision_id))["status"] == "rejected"
+    refused = _step(_last_run(tmp_path, decision_id), "reconciliation_not_attempted")
+    assert "says no position exists" in refused["reasons"][0]
+    assert "squared by hand" in capsys.readouterr().out
+    await session.close()
+    await db.close()
+
+
+async def test_resolve_finishes_a_run_that_died_between_finality_and_reconciliation(
+    tmp_path, monkeypatch
+):
+    """A run already at `finalized` is one step short, and the step is the same.
+
+    Reached two ways in practice: the process died after recording finality,
+    or the post-trade balance probe failed and the run ended in review. Either
+    way the comparison has not been made against a wallet anyone could read.
+    """
+    runner, db, session, decision_id, _sig = await _run_to_finalized_unreconciled(
+        tmp_path, monkeypatch
+    )
+
+    with aioresponses() as m:
+        _mock_resolve_rpc(m, status="finalized")
+        assert await runner.resolve(decision_id=decision_id) == EXIT_BLOCKED
+    assert (await solana_lane.load_execution(db, decision_id))["state"] == "reconciled"
+
+    # And a reconciled run is finished: resolving it again reads the sweep,
+    # touches nothing, and attempts no second comparison.
+    with aioresponses() as m:
+        _mock_resolve_rpc(m, status="finalized", record=_NO_RECONCILIATION)
+        assert await runner.resolve(decision_id=decision_id) == EXIT_BLOCKED
+        assert _rpc_calls(m) == 3
+    assert (await solana_lane.load_execution(db, decision_id))["state"] == "reconciled"
+    assert _step(_last_run(tmp_path, decision_id), "reconciliation") is None
+    await session.close()
+    await db.close()
+
+
+async def _run_to_finalized_unreconciled(tmp_path, monkeypatch):
+    """A run that reached `finalized` and then could not read the wallet."""
+    tx = build_swap_tx().tx_b64
+    _authorize(monkeypatch, _phrase(tx))
+    runner, db, session = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        _mock_quote_and_build(m, tx)
+        _mock_pre_approval_rpc(m)
+        _mock_post_approval_rpc(m)
+        m.post(_SUBMIT_RE, payload=_rpc(_expected_signature(tx)))
+        m.post(_RPC_URL, payload=_sig_status())  # finalized inside the window
+        m.post(_RPC_URL, payload=_rpc(_chain_record()))
+        m.post(_RPC_URL, exception=TimeoutError())  # SOL balance probe fails
+        m.post(_RPC_URL, payload=_token_accounts(_OUT_RAW))
+        assert await runner.place(sol=_SOL) == EXIT_REVIEW
+    decision_id = _step(_steps(tmp_path), "run_started")["decision_id"]
+    assert (await solana_lane.load_execution(db, decision_id))["state"] == "finalized"
+    return runner, db, session, decision_id, _expected_signature(tx)
+
+
+async def test_a_finalized_run_is_not_reconciled_on_a_less_than_finalized_answer(
+    tmp_path, monkeypatch
+):
+    """The gate is what the cluster says NOW, not what the row already says.
+
+    The row is at `finalized`, so the transition table would permit
+    `reconciled`. A resolver that answers 'confirmed' — a lagging node, or a
+    reorg — is not grounds to take it, and the row does not walk backwards
+    either.
+    """
+    runner, db, session, decision_id, _sig = await _run_to_finalized_unreconciled(
+        tmp_path, monkeypatch
+    )
+    with aioresponses() as m:
+        _mock_resolve_rpc(m, status="confirmed", record=_NO_RECONCILIATION)
+        assert await runner.resolve(decision_id=decision_id) == EXIT_BLOCKED
+        assert _rpc_calls(m) == 3
+    assert (await solana_lane.load_execution(db, decision_id))["state"] == "finalized"
+    steps = _last_run(tmp_path, decision_id)
+    assert _step(steps, "reconciliation") is None
+    assert _step(steps, "landed")["execution_state"] == "finalized"
+    await session.close()
+    await db.close()
+
+
+async def test_the_late_reconciliation_itself_refuses_an_unrooted_transaction(
+    tmp_path, monkeypatch
+):
+    """Second lock on the same door.
+
+    `resolve` only calls the late reconciliation on a finalized answer. This
+    calls it directly with one that is not, with a wallet and a transaction
+    record that agree in every other respect — the comparison must still
+    refuse, so the property does not rest on one `if` in one caller.
+    """
+    runner, db, session, decision_id, signature = await _run_to_finalized_unreconciled(
+        tmp_path, monkeypatch
+    )
+    from scout.live.solana.resolver import ResolutionReport
+
+    resolution = ResolutionReport(
+        verdict="landed",
+        signature=signature,
+        last_valid_block_height=_LAST_VALID,
+        probes=(),
+        checked_at=datetime.now(timezone.utc).isoformat(),
+        slot=283_000_455,
+        confirmation_status="confirmed",
+    )
+    with aioresponses() as m:
+        m.post(_RPC_URL, payload=_rpc(_chain_record()))
+        m.post(_RPC_URL, payload=_rpc({"context": {"slot": 1}, "value": _SOL_AFTER}))
+        m.post(_RPC_URL, payload=_token_accounts(_OUT_RAW))
+        outcome = await runner._reconcile_after_resolution(
+            evidence=runner._evidence_for(decision_id),
+            decision_id=decision_id,
+            row=await _row(db, decision_id),
+            signature=signature,
+            resolution=resolution,
+        )
+    assert outcome["attempted"] is True
+    assert outcome["verdict"] == "review"
+    assert outcome["execution_state"] == "finalized"
+    assert len(outcome["reasons"]) == 1
+    assert "a fork can still undo" in outcome["reasons"][0]
+    assert (await solana_lane.load_execution(db, decision_id))["state"] == "finalized"
+    await session.close()
+    await db.close()
+
+
+async def test_the_late_reconciliation_does_nothing_to_a_run_that_is_not_finalized(
+    tmp_path, monkeypatch
+):
+    """And the third: it will not start from `landed` at all."""
+    _code, runner, db, session, decision_id, signature = await _run_into_unrooted(
+        tmp_path, monkeypatch, via="finalize_timeout"
+    )
+    from scout.live.solana.resolver import ResolutionReport
+
+    resolution = ResolutionReport(
+        verdict="landed",
+        signature=signature,
+        last_valid_block_height=_LAST_VALID,
+        probes=(),
+        checked_at=datetime.now(timezone.utc).isoformat(),
+        slot=283_000_455,
+        confirmation_status="finalized",
+    )
+    with aioresponses() as m:
+        outcome = await runner._reconcile_after_resolution(
+            evidence=runner._evidence_for(decision_id),
+            decision_id=decision_id,
+            row=await _row(db, decision_id),
+            signature=signature,
+            resolution=resolution,
+        )
+        assert list(m.requests) == []  # nothing was read
+    assert outcome["attempted"] is False
+    assert outcome["execution_state"] == "landed"
+    assert (await solana_lane.load_execution(db, decision_id))["state"] == "landed"
+    await session.close()
+    await db.close()
+
+
+async def test_the_basis_read_back_is_the_basis_the_run_reconciled_against(
+    tmp_path, monkeypatch
+):
+    """One reconciliation, two sources for its inputs — which must be equal.
+
+    If the evidence file ever stopped carrying one of these numbers, or carried
+    it under another name, a late reconciliation would be comparing against
+    something the run never held. Pinned against the fixture's own constants
+    rather than against the runner, so the two agree only if both are right.
+    """
+    tx = build_swap_tx().tx_b64
+    _authorize(monkeypatch, _phrase(tx))
+    runner, db, session = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        _mock_happy_path(m, tx)
+        assert await runner.place(sol=_SOL) == EXIT_OK
+    decision_id = _step(_steps(tmp_path), "run_started")["decision_id"]
+    execution = await solana_lane.load_execution(db, decision_id)
+
+    basis, signer, problems = solana_lane.read_reconciliation_basis(
+        tmp_path / "evidence",
+        decision_id,
+        execution=execution,
+        signature=_expected_signature(tx),
+    )
+    assert problems == []
+    assert signer == PAYER_PUBKEY
+    assert basis == solana_lane.ReconciliationBasis(
+        amount_lamports=_LAMPORTS,
+        min_out_raw=_MIN_OUT_RAW,
+        quoted_out_raw=_OUT_RAW,
+        total_fee_lamports=_TOTAL_FEE,
+        ata_rent_lamports=_ATA_RENT,
+        sol_before_lamports=_SOL_BEFORE,
+        usdc_before_raw=0,
+    )
+    await session.close()
+    await db.close()
+
+
+async def test_the_basis_is_refused_when_the_row_cannot_vouch_for_the_file(
+    tmp_path, monkeypatch
+):
+    """The row is the authority. A row that says nothing vouches for nothing."""
+    tx = build_swap_tx().tx_b64
+    _authorize(monkeypatch, _phrase(tx))
+    runner, db, session = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        _mock_happy_path(m, tx)
+        assert await runner.place(sol=_SOL) == EXIT_OK
+    decision_id = _step(_steps(tmp_path), "run_started")["decision_id"]
+    execution = await solana_lane.load_execution(db, decision_id)
+    signature = _expected_signature(tx)
+
+    def _read(**row_overrides):
+        return solana_lane.read_reconciliation_basis(
+            tmp_path / "evidence",
+            decision_id,
+            execution={**execution, **row_overrides},
+            signature=signature,
+        )
+
+    assert _read()[2] == []
+    for override, fragment in (
+        ({"amount_lamports": None}, "carries no amount"),
+        ({"minimum_out_raw": None}, "carries no amount"),
+        ({"message_sha256": None}, "carries no amount"),
+        ({"expected_signature": None}, "carries no amount"),
+        ({"expected_signature": "5" * 88}, "holds a different signature"),
+        ({"amount_lamports": _LAMPORTS + 1}, "the swap amount disagrees"),
+        ({"minimum_out_raw": _MIN_OUT_RAW - 1}, "minimum output disagrees"),
+        ({"message_sha256": "f" * 64}, "the message hash disagrees"),
+    ):
+        basis, signer, problems = _read(**override)
+        assert basis is None and signer is None, override
+        assert any(fragment in problem for problem in problems), (override, problems)
+    # Another decision's file is not this decision's file.
+    other = solana_lane.read_reconciliation_basis(
+        tmp_path / "evidence",
+        "00000000-0000-4000-8000-000000000000",
+        execution=execution,
+        signature=signature,
+    )
+    assert other[0] is None and other[2]
+    await session.close()
+    await db.close()
+
+
+def test_a_transactions_own_record_states_what_it_did_to_the_wallet():
+    deltas = solana_lane.transaction_wallet_deltas
+    assert deltas(_chain_record(), owner=PAYER_PUBKEY, mint=USDC_MINT) == (
+        _LAMPORTS + _TX_FEES,
+        _OUT_RAW,
+        [],
+    )
+    # A wallet that already held USDC: the delta, not the balance.
+    held = _chain_record(usdc_before=3_000_000)
+    assert deltas(held, owner=PAYER_PUBKEY, mint=USDC_MINT)[1] == _OUT_RAW
+    # Another owner's token account in the same transaction is not ours.
+    other = _chain_record(owner=str(OTHER.pubkey()))
+    assert deltas(other, owner=PAYER_PUBKEY, mint=USDC_MINT)[1] == 0
+    # The plain-string account-key shape (non-parsed encodings) reads the same.
+    plain = _chain_record()
+    plain["transaction"]["message"]["accountKeys"] = [
+        k["pubkey"] for k in plain["transaction"]["message"]["accountKeys"]
+    ]
+    assert deltas(plain, owner=PAYER_PUBKEY, mint=USDC_MINT)[:2] == (
+        _LAMPORTS + _TX_FEES,
+        _OUT_RAW,
+    )
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        lambda r: r.pop("meta"),
+        lambda r: r["meta"].pop("preBalances"),
+        lambda r: r["meta"].pop("postTokenBalances"),
+        lambda r: r["meta"].__setitem__("preTokenBalances", None),
+        lambda r: r["meta"]["postBalances"].__setitem__(0, "lots"),
+        lambda r: r["meta"]["postTokenBalances"][0].pop("uiTokenAmount"),
+        lambda r: r["transaction"].pop("message"),
+    ],
+)
+def test_a_damaged_transaction_record_is_a_problem_not_a_zero(damage):
+    """Absent must never read as "moved nothing"."""
+    record = _chain_record()
+    damage(record)
+    sol, usdc, problems = solana_lane.transaction_wallet_deltas(
+        record, owner=PAYER_PUBKEY, mint=USDC_MINT
+    )
+    assert problems
+    assert sol is None or usdc is None
+
+
+def test_reconciled_is_still_reachable_only_through_a_rooted_state():
+    """The table did not move. `resolve` got a way to WALK it, not a shortcut.
+
+    `landed -> reconciled` would mean reconciling against a transaction a fork
+    can still undo, and it is absent here on purpose.
+    """
+    lane = solana_lane
+    into_reconciled = {
+        state
+        for state, successors in lane.LEGAL_TRANSITIONS.items()
+        if lane.STATE_RECONCILED in successors
+    }
+    assert into_reconciled == {lane.STATE_CONFIRMED, lane.STATE_FINALIZED}
+    for state in (
+        lane.STATE_LANDED,
+        lane.STATE_SUBMISSION_ATTEMPTED,
+        lane.STATE_SUBMISSION_UNKNOWN,
+    ):
+        with pytest.raises(lane.IllegalStateTransition):
+            lane.assert_legal_transition(state, lane.STATE_RECONCILED)
+        lane.assert_legal_transition(state, lane.STATE_FINALIZED)
+    with pytest.raises(lane.IllegalStateTransition):
+        lane.assert_legal_transition(lane.STATE_LANDED, lane.STATE_LANDED)
+
+
 async def test_resolve_refuses_an_unknown_decision_id(tmp_path):
     runner, db, session = await _make_runner(tmp_path)
     assert (
