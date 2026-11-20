@@ -70,7 +70,7 @@ commit by the reviewers and fail there.
 | Full suite on untouched master (baseline, this container) | 41 failed, 8978 passed, 28 skipped |
 | Full suite at `bea91036`, first run | 47 failed, 9108 passed, 28 skipped — the 41 baseline failures plus 6 in `tests/test_receipt_archive.py` |
 | Those 6, investigated | Every one asserted an archive outcome and got `disk_pressure`: 27 GB of pytest temp directories from this session's repeated suite runs had filled the disk past the tests' own threshold. After deleting `/tmp/pytest-of-root`, `tests/test_receipt_archive.py`: 12 passed. Not related to the change. |
-| Full suite at `bea91036`, rerun after clearing the disk | see section 6 |
+| Full suite at `42c1a667` (`bea91036` plus this report), after clearing the disk | **41 failed, 9114 passed, 28 skipped — the failing set is identical, test for test, to the master baseline** |
 
 The 41 baseline failures are environment-dependent script tests
 (`test_revival_verdict_watchdog.py` 17, `test_backup_create_script.py` 9,
@@ -123,9 +123,14 @@ Nothing is flagged `executed-without-recorded-approval`.
 
 ## 6. Final full-suite run
 
-A rerun at `bea91036` after clearing the disk was interrupted at 81% by a
-container restart, with no failure printed up to that point. It has been
-restarted; this section is updated when it finishes. Until then the clean
-full-suite evidence for the final head is the first run in section 3 (the 41
-baseline failures plus 6 disk-pressure failures that pass once the disk is
-cleared).
+Run at `42c1a667` — the final code head `bea91036` plus the commit that added
+this report — after clearing the disk:
+
+    41 failed, 9114 passed, 28 skipped in 1324.42s
+
+The 41 failing tests are the same 41, by name, that fail on untouched master
+in this container (section 3). No test fails on the branch that passes on
+master. Against master's 8978 passed, the branch adds 136 passing tests.
+
+An earlier rerun was interrupted at 81% by a container restart with no
+failure printed up to that point; this run replaces it.
