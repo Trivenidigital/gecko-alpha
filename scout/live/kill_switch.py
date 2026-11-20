@@ -467,11 +467,12 @@ class KillSwitch:
         conn = self._db._conn
         pending: list[int] = []
         async with self._db._txn_lock:
+            settle_closed = True
             if conn.in_transaction:
-                await self._commit_or_log_locked(
+                settle_closed = await self._commit_or_log_locked(
                     "trigger_final_settle", kill_event_ids=sorted(our_ids)
                 )
-            if not conn.in_transaction:
+            if settle_closed:
                 try:
                     settled = await self._owned_pointer_locked(our_ids)
                 except sqlite3.Error as exc:
@@ -487,7 +488,7 @@ class KillSwitch:
                 # the open transaction sees them), so the operator knows
                 # which claim may yet take effect.
                 pending = await self._our_rows_present_locked(our_ids)
-        unconfirmable = bool(conn.in_transaction)
+        unconfirmable = not settle_closed
         state = None
         if settled is None and not unconfirmable:
             try:
@@ -621,6 +622,7 @@ class KillSwitch:
         new_id: int | None = None
         released: tuple[int, str, timedelta | None] | None = None
         error: sqlite3.Error | None = None
+        committed = False
         try:
             # Insert the row first — speculative. If we lose the race we
             # DELETE it below.
@@ -645,16 +647,17 @@ class KillSwitch:
             if cur.rowcount != 1:
                 await conn.execute("DELETE FROM kill_events WHERE id = ?", (new_id,))
             await conn.commit()
+            committed = True
         except sqlite3.Error as exc:
             # e.g. the claim names a row a foreign rollback removed (FOREIGN
             # KEY), or the commit hit a lock. End the transaction; what it
             # left behind is judged below from the committed state.
             error = exc
-            await self._commit_or_log_locked(
+            committed = await self._commit_or_log_locked(
                 "trigger_attempt", kill_event_id=new_id, triggered_by=triggered_by
             )
 
-        if conn.in_transaction:
+        if not committed:
             # Both commits failed: what a read shows now is our own
             # uncommitted work, not what is durably in force. Judge nothing;
             # the next attempt's commit will settle it.
@@ -842,19 +845,23 @@ class KillSwitch:
             "released_event_stamp", kill_event_id=released_id
         )
 
-    async def _commit_or_log_locked(self, what: str, **context: object) -> None:
+    async def _commit_or_log_locked(self, what: str, **context: object) -> bool:
         """COMMIT, retrying once; log at ERROR if both fail. Caller holds the
         txn lock. A failed COMMIT leaves the write transaction open, holding
         the database's write lock against other processes, so it is worth one
-        more try. Callers that must not act on uncommitted state check
-        ``conn.in_transaction`` themselves afterwards."""
+        more try.
+
+        Returns whether OUR commit succeeded. Callers decide from this, not
+        from ``conn.in_transaction``: a writer that does not take the lock can
+        open its own transaction on the shared connection right after ours
+        closed, and that says nothing about whether our work is durable."""
         conn = self._db._conn
         assert conn is not None
         last: sqlite3.Error | None = None
         for _ in range(2):
             try:
                 await conn.commit()
-                return
+                return True
             except sqlite3.Error as exc:
                 last = exc
         log.error(
@@ -865,6 +872,7 @@ class KillSwitch:
             transaction_left_open=bool(conn.in_transaction),
             **context,
         )
+        return False
 
     async def clear(self, *, cleared_by: str) -> int | None:
         """Clear the active kill, if any. Returns the cleared event id, or

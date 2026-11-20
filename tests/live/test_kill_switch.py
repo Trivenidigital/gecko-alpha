@@ -1704,3 +1704,48 @@ async def test_a_failing_dead_pointer_check_is_a_retry_not_an_exception(tmp_path
         db._conn.execute = real_execute
     assert (winner, won) == (live_id, False)
     await db.close()
+
+
+async def test_a_foreign_transaction_after_the_settle_commit_does_not_hide_the_win(
+    tmp_path,
+):
+    """The final settle's commit lands this call's claim; then a writer that
+    does not take the lock opens a transaction on the shared connection. The
+    call must judge by whether ITS commit succeeded, not by in_transaction."""
+    import sqlite3
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    alerts: list[str] = []
+
+    async def _hook(text):
+        alerts.append(text)
+
+    ks = KillSwitch(db, alert_hook=_hook)
+    attempt_commits = 9  # three attempts x (commit + two tries) all fail
+
+    async def _fail_then_foreign(n, real_commit):
+        if n <= attempt_commits:
+            raise sqlite3.OperationalError("database is locked")
+        await real_commit()
+        if n == attempt_commits + 1:
+            # an unlocked writer starts a transaction right after our commit
+            await db._conn.execute(
+                "UPDATE live_metrics_daily SET value = value WHERE 0"
+            )
+
+    _calls, real_commit = _patch_commit(db, _fail_then_foreign)
+    try:
+        kid, won = await ks.trigger(
+            triggered_by="manual", reason="op", duration=timedelta(hours=1)
+        )
+    finally:
+        db._conn.commit = real_commit
+    await db._conn.commit()  # end the foreign transaction
+
+    assert won is True
+    state = await ks.is_active()
+    assert state is not None and state.kill_event_id == kid
+    assert sum("TRIGGERED" in a for a in alerts) == 1
+    assert not any("NOT ENGAGED" in a for a in alerts)
+    await db.close()
