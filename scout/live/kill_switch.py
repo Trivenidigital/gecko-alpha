@@ -49,6 +49,22 @@ _TRIGGER_ATTEMPTS = 3
 # so a caller that also counts failures does not count it twice.
 _COUNTED_ATTR = "kill_trigger_errors_counted"
 
+_last_attempt_at: datetime | None = None
+
+
+def _unique_utc_now() -> datetime:
+    """UTC now, strictly later than any value this function returned before
+    in this process. trigger() stamps each attempt's row with it and later
+    recognises its own row by (id, triggered_at); ids alone are not unique
+    once a rollback has rewound AUTOINCREMENT, and a coarse clock could give
+    two attempts the same time."""
+    global _last_attempt_at
+    now = datetime.now(timezone.utc)
+    if _last_attempt_at is not None and now <= _last_attempt_at:
+        now = _last_attempt_at + timedelta(microseconds=1)
+    _last_attempt_at = now
+    return now
+
 
 def compute_kill_duration(trigger_time: datetime) -> timedelta:
     """Returns ``max(4h, time until next UTC midnight)``.
@@ -380,8 +396,9 @@ class KillSwitch:
         for attempt in range(1, _TRIGGER_ATTEMPTS + 1):
             async with self._db._txn_lock:
                 # Judged under the lock: a trigger that queued behind another
-                # holder must see the clock as it is when it gets in.
-                now = datetime.now(timezone.utc)
+                # holder must see the clock as it is when it gets in. Unique
+                # per attempt: it is half of how this call knows its own row.
+                now = _unique_utc_now()
                 killed_until = now + duration
                 verdict, event_id, attempt_released, error = (
                     await self._trigger_attempt_locked(

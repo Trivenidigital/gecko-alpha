@@ -1275,3 +1275,50 @@ async def test_a_reused_event_id_is_not_mistaken_for_this_calls_kill(tmp_path):
     assert winner == state["other_id"]
     assert not any("TRIGGERED" in a for a in alerts)
     await db.close()
+
+
+async def test_two_concurrent_triggers_never_both_win_when_an_id_is_reused(tmp_path):
+    """Reviewer's sequence: A inserts id N, a foreign rollback undoes it (and
+    AUTOINCREMENT's counter), B inserts and gets the same N, claims and wins.
+    A's next attempt sees pointer N — which is B's kill, not A's."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    alerts: list[str] = []
+
+    async def _hook(text):
+        alerts.append(text)
+
+    ks = KillSwitch(db, alert_hook=_hook)
+    real_execute = db._conn.execute
+    state = {"done": False}
+
+    async def _execute(sql, *args, **kwargs):
+        cur = await real_execute(sql, *args, **kwargs)
+        if "INSERT INTO kill_events" in sql and not state["done"]:
+            state["done"] = True
+            await db._conn.rollback()  # an unlocked writer elsewhere
+        return cur
+
+    db._conn.execute = _execute
+    try:
+        results = await asyncio.gather(
+            ks.trigger(triggered_by="manual", reason="A", duration=timedelta(hours=1)),
+            ks.trigger(triggered_by="manual", reason="B", duration=timedelta(hours=1)),
+        )
+    finally:
+        db._conn.execute = real_execute
+
+    winners = [r for r in results if r[1]]
+    assert len(winners) == 1, results
+    assert results[0][0] == results[1][0]  # both name the one kill in force
+    assert sum("TRIGGERED" in a for a in alerts) == 1
+    state_now = await ks.is_active()
+    assert state_now is not None and state_now.kill_event_id == winners[0][0]
+    await db.close()
+
+
+def test_attempt_timestamps_are_strictly_increasing():
+    from scout.live.kill_switch import _unique_utc_now
+
+    stamps = [_unique_utc_now() for _ in range(2000)]
+    assert all(b > a for a, b in zip(stamps, stamps[1:]))
