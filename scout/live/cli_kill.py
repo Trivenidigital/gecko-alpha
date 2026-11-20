@@ -90,7 +90,15 @@ async def main() -> int:
             if won:
                 print(f"kill_event_id={kid} won=True")
                 return 0
-            still = await ks.is_active()
+            try:
+                still = await ks.is_active()
+            except ValueError:
+                print(
+                    "NOT engaged — the active kill's killed_until cannot be "
+                    "read, so whether trading is halted is unknown; inspect "
+                    "kill_events by hand"
+                )
+                return 1
             if still is not None:
                 # Another kill was already in force; trading is halted.
                 print(

@@ -97,7 +97,7 @@ class KillSwitch:
         self,
         *,
         event_type: str,
-        kill_event_id: int,
+        kill_event_id: int | None,
         triggered_by: str | None = None,
         reason: str | None = None,
         killed_until: datetime | None = None,
@@ -127,7 +127,8 @@ class KillSwitch:
                 "LIVE KILL-SWITCH NOT ENGAGED\n"
                 f"requested by {triggered_by}\n"
                 f"reason: {reason}\n"
-                "live trading is NOT halted — engage it by hand "
+                "no kill could be confirmed in force — treat live trading "
+                "as NOT halted and engage it by hand "
                 "(python -m scout.live.cli_kill --on ...)"
             )
         elif event_type == "latched_auto_clear":
@@ -363,6 +364,10 @@ class KillSwitch:
         released: tuple[int, str, timedelta | None] | None = None
         killed_until = datetime.now(timezone.utc) + duration
         last_error: sqlite3.Error | None = None
+        # Every speculative row this call inserted. A claim left uncommitted
+        # by a failed commit can become durable during a LATER attempt; the
+        # kill it engages is still this call's kill.
+        our_ids: set[int] = set()
         for attempt in range(1, _TRIGGER_ATTEMPTS + 1):
             async with self._db._txn_lock:
                 # Judged under the lock: a trigger that queued behind another
@@ -375,6 +380,7 @@ class KillSwitch:
                         reason=reason,
                         now=now,
                         killed_until=killed_until,
+                        our_ids=our_ids,
                     )
                 )
                 # A release that a later attempt cannot see again (it was
@@ -420,6 +426,17 @@ class KillSwitch:
                     winner_id=event_id,
                     attempts=attempt,
                 )
+                if error is not None:
+                    # Trading is halted by the other kill, but this call
+                    # failed for its own reason (a bad triggered_by, say);
+                    # do not let that hide behind the lost race.
+                    log.error(
+                        "live_kill_trigger_error_while_lost",
+                        winner_id=event_id,
+                        triggered_by=triggered_by,
+                        error=str(error),
+                        error_type=type(error).__name__,
+                    )
                 return event_id, False
             log.warning(
                 "live_kill_trigger_retry",
@@ -429,8 +446,14 @@ class KillSwitch:
                 error_type=None if error is None else type(error).__name__,
             )
 
-        # No attempt engaged a kill.
-        state = await self.is_active()
+        # No attempt engaged a kill. With a write transaction still open
+        # (every commit failed), is_active() would read uncommitted state, so
+        # nothing can be confirmed in force.
+        unconfirmable = bool(self._db._conn.in_transaction)
+        try:
+            state = None if unconfirmable else await self.is_active()
+        except ValueError:  # an unreadable killed_until on the pointer
+            state = None
         active_id = state.kill_event_id if state is not None else None
         log.error(
             "live_kill_trigger_unconfirmed",
@@ -438,22 +461,31 @@ class KillSwitch:
             reason=reason,
             attempts=_TRIGGER_ATTEMPTS,
             active_kill_event_id=active_id,
+            transaction_left_open=unconfirmable,
             last_error=None if last_error is None else str(last_error),
         )
+        will_raise = last_error is not None and state is None
         if state is None:
-            try:
-                from scout.live.metrics import inc
+            if not will_raise:
+                # A raised error is counted by the caller that catches it
+                # (maybe_trigger_from_daily_loss); count only what returns.
+                try:
+                    from scout.live.metrics import inc
 
-                await inc(self._db, "kill_trigger_errors")
-            except Exception:  # noqa: BLE001 - the alert below must still go
-                log.exception("live_kill_trigger_metric_failed")
+                    await inc(self._db, "kill_trigger_errors")
+                except Exception:  # noqa: BLE001 - the alert below must still go
+                    log.exception("live_kill_trigger_metric_failed")
             await self._emit_alert(
                 event_type="not_engaged",
-                kill_event_id=0,
+                kill_event_id=None,
                 triggered_by=triggered_by,
-                reason=reason,
+                reason=(
+                    reason
+                    if last_error is None
+                    else f"{reason} (last error: {last_error})"
+                ),
             )
-        if last_error is not None and state is None:
+        if will_raise:
             raise last_error
         return active_id, False
 
@@ -464,6 +496,7 @@ class KillSwitch:
         reason: str,
         now: datetime,
         killed_until: datetime,
+        our_ids: set[int],
     ) -> tuple[
         str,
         int | None,
@@ -476,9 +509,12 @@ class KillSwitch:
         Returns ``(verdict, event_id, released, error)`` where verdict is
         ``"won"`` (event_id is ours and durably in force), ``"lost"``
         (event_id is a different kill in force) or ``"retry"`` (the pointer is
-        dead again: our work was undone). Never leaves a write transaction
-        open, and ends it with COMMIT, never ROLLBACK — a rollback on the
-        shared connection would discard other writers' work.
+        dead again: our work was undone — or a commit failed and nothing can
+        be confirmed). Ends its transaction with COMMIT, never ROLLBACK — a
+        rollback on the shared connection would discard other writers' work.
+        If every commit fails the transaction stays open, and the verdict is
+        then "retry", never "won": an open transaction's reads include its
+        own uncommitted claim.
         """
         conn = self._db._conn
         assert conn is not None
@@ -496,6 +532,7 @@ class KillSwitch:
             )
             cur = await conn.execute("SELECT last_insert_rowid()")
             new_id = (await cur.fetchone())[0]
+            our_ids.add(new_id)
             # Only after the INSERT has succeeded: if it raises (a CHECK on
             # triggered_by, say) nothing has been released.
             released = await self._release_dead_pointer_locked(now)
@@ -513,14 +550,13 @@ class KillSwitch:
             # KEY), or the commit hit a lock. End the transaction; what it
             # left behind is judged below from the committed state.
             error = exc
-            try:
-                await conn.commit()
-            except sqlite3.Error as exc2:
-                log.error(
-                    "live_kill_trigger_commit_failed",
-                    error=str(exc2),
-                    error_type=type(exc2).__name__,
-                )
+            await self._commit_or_log_locked("trigger_attempt")
+
+        if conn.in_transaction:
+            # Both commits failed: what a read shows now is our own
+            # uncommitted work, not what is durably in force. Judge nothing;
+            # the next attempt's commit will settle it.
+            return "retry", None, released, error
 
         # What is durably in force now? Committed state cannot be undone by a
         # later rollback, so this is the only safe basis for "won".
@@ -532,26 +568,26 @@ class KillSwitch:
         )
         row = await cur.fetchone()
         pointer = row[0] if row is not None else None
-        if new_id is not None and pointer == new_id and row[1] == new_id:
-            return "won", new_id, released, error
+        if pointer is not None and pointer in our_ids and row[1] == pointer:
+            return "won", pointer, released, error
 
-        if new_id is not None:
-            # Our speculative row, if it survived, must not linger unreferenced.
+        # Our speculative rows, if any survived, must not linger unreferenced.
+        for orphan_id in sorted(our_ids - {pointer}):
             try:
                 await conn.execute(
                     "DELETE FROM kill_events WHERE id = ? AND id NOT IN ("
                     "SELECT active_kill_event_id FROM live_control "
                     "WHERE active_kill_event_id IS NOT NULL)",
-                    (new_id,),
+                    (orphan_id,),
                 )
-                await conn.commit()
             except sqlite3.Error as exc:
                 log.error(
                     "live_kill_trigger_orphan_row_not_removed",
-                    kill_event_id=new_id,
+                    kill_event_id=orphan_id,
                     error=str(exc),
                     error_type=type(exc).__name__,
                 )
+        await self._commit_or_log_locked("trigger_orphan_cleanup")
         if await self._pointer_is_dead_locked(now):
             return "retry", None, released, error
         return "lost", pointer, released, error
@@ -573,7 +609,6 @@ class KillSwitch:
                 "WHERE id = ? AND cleared_at IS NULL",
                 (now.isoformat(), released_id),
             )
-            await conn.commit()
         except sqlite3.Error as exc:
             log.error(
                 "live_kill_released_event_not_stamped",
@@ -581,6 +616,30 @@ class KillSwitch:
                 error=str(exc),
                 error_type=type(exc).__name__,
             )
+        await self._commit_or_log_locked("released_event_stamp")
+
+    async def _commit_or_log_locked(self, what: str) -> bool:
+        """COMMIT, retrying once; log at ERROR if both fail. Returns whether
+        the transaction is closed. Caller holds the txn lock. A failed COMMIT
+        leaves the write transaction open, holding the database's write lock
+        against other processes, so it is worth one more try."""
+        conn = self._db._conn
+        assert conn is not None
+        last: sqlite3.Error | None = None
+        for _ in range(2):
+            try:
+                await conn.commit()
+                return True
+            except sqlite3.Error as exc:
+                last = exc
+        log.error(
+            "live_kill_commit_failed",
+            what=what,
+            error=str(last),
+            error_type=type(last).__name__,
+            transaction_left_open=bool(conn.in_transaction),
+        )
+        return not conn.in_transaction
 
     async def clear(self, *, cleared_by: str) -> int | None:
         """Clear the active kill, if any. Returns the cleared event id, or
@@ -797,7 +856,10 @@ async def maybe_trigger_from_daily_loss(
     except Exception as exc:
         from scout.live.metrics import inc
 
-        await inc(db, "kill_trigger_errors")
+        try:
+            await inc(db, "kill_trigger_errors")
+        except Exception:  # noqa: BLE001 - the error log below must still go
+            log.exception("live_kill_trigger_metric_failed")
         log.error(
             "live_kill_trigger_failed",
             exception=str(exc),

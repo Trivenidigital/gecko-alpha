@@ -979,9 +979,11 @@ KILL_SWITCH = Machine(
         "shared connection mid-trigger. Each trigger attempt commits, then "
         "reads the committed pointer back, and reports a win only for a "
         "kill durably in force. An undone attempt is retried, three attempts "
-        "in all. If none engages a kill it logs live_kill_trigger_unconfirmed "
-        "at ERROR, sends a NOT ENGAGED alert and returns (None, False); the "
-        "kill CLI then exits 1.",
+        "in all; an attempt whose commits all fail is never counted as a win. "
+        "If none engages a kill it logs live_kill_trigger_unconfirmed at "
+        "ERROR, sends a NOT ENGAGED alert and returns (None, False) — or "
+        "re-raises the last database error, if there was one. The kill CLI "
+        "then exits 1.",
         "A pointer left on an already-cleared event matches no state: the "
         "switch reads as inactive. No automatic clear releases it; the next "
         "trigger does, and so does an operator clear. The auditor reports "

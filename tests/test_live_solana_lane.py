@@ -4893,3 +4893,37 @@ async def test_catch_up_rechecks_when_the_row_moves_between_check_and_write(
     assert execution["state"] == solana_lane.STATE_LANDED
     await session.close()
     await db.close()
+
+
+async def test_catch_up_survives_the_row_moving_twice(tmp_path, monkeypatch):
+    real_load = solana_lane.load_execution
+    stale = {"armed": False, "left": 2}
+
+    async def _operator_resolve(db, decision_id):
+        await solana_lane.record_execution_state(
+            db, decision_id, solana_lane.STATE_LANDED, mode="SUPERVISED_LIVE"
+        )
+        stale["armed"] = True
+
+    async def _load(db, decision_id):
+        row = await real_load(db, decision_id)
+        if stale["armed"] and stale["left"] > 0 and row is not None:
+            stale["left"] -= 1
+            return {**row, "state": solana_lane.STATE_SUBMISSION_ATTEMPTED}
+        return row
+
+    monkeypatch.setattr(solana_lane, "load_execution", _load)
+    code, db, session, steps, execution, submissions = (
+        await _run_confirm_timeout_then_adopted(
+            tmp_path,
+            monkeypatch,
+            resolver_status="confirmed",
+            after_adoption=_operator_resolve,
+        )
+    )
+    assert stale["left"] == 0
+    assert _step(steps, "unexpected_error") is None
+    assert code == EXIT_REVIEW
+    assert execution["state"] == solana_lane.STATE_LANDED
+    await session.close()
+    await db.close()

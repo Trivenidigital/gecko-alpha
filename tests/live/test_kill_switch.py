@@ -1005,3 +1005,90 @@ async def test_the_latched_alert_survives_a_retried_attempt(tmp_path):
     cleared_at, cleared_by = await cur.fetchone()
     assert cleared_at is not None and cleared_by == "auto_expired"
     await db.close()
+
+
+# --- vector review findings at 896b65c8 --------------------------------------
+
+
+async def test_a_twice_failed_commit_is_never_reported_as_a_win_on_trust(tmp_path):
+    """If the commit and its retry both fail, the transaction is still open
+    and the read-back sees the call's own UNCOMMITTED claim. That must not be
+    reported as a win; the next attempt must make it durable, and the call
+    must then report the kill it actually engaged."""
+    import sqlite3
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    alerts: list[str] = []
+
+    async def _hook(text):
+        alerts.append(text)
+
+    ks = KillSwitch(db, alert_hook=_hook)
+
+    async def _fail_twice(n, real_commit):
+        if n <= 2:
+            raise sqlite3.OperationalError("database is locked")
+        await real_commit()
+
+    _calls, real_commit = _patch_commit(db, _fail_twice)
+    try:
+        kid, won = await ks.trigger(
+            triggered_by="manual", reason="op", duration=timedelta(hours=1)
+        )
+    finally:
+        db._conn.commit = real_commit
+
+    assert db._conn.in_transaction is False
+    assert won is True
+    # Durable: survives a foreign rollback.
+    await db._conn.rollback()
+    state = await ks.is_active()
+    assert state is not None and state.kill_event_id == kid
+    assert sum("TRIGGERED" in a for a in alerts) == 1
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM kill_events WHERE cleared_at IS NULL"
+    )
+    assert (await cur.fetchone())[0] == 1
+    await db.close()
+
+
+async def test_a_caller_error_is_not_hidden_when_another_kill_is_in_force(tmp_path):
+    """A CHECK-violating triggered_by while a live kill exists: trading is
+    halted either way, but the bad caller must surface at ERROR."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    ks = KillSwitch(db)
+    live_id, _ = await ks.trigger(
+        triggered_by="manual", reason="first", duration=timedelta(hours=1)
+    )
+
+    with structlog.testing.capture_logs() as logs:
+        winner, won = await ks.trigger(
+            triggered_by="not_a_valid_source", reason="x", duration=timedelta(hours=1)
+        )
+
+    assert (winner, won) == (live_id, False)
+    errors = [e for e in logs if e.get("event") == "live_kill_trigger_error_while_lost"]
+    assert errors and errors[0]["log_level"] == "error"
+    await db.close()
+
+
+async def test_a_raised_trigger_failure_is_counted_once_by_the_caller(tmp_path):
+    """When trigger re-raises, the caller (maybe_trigger_from_daily_loss)
+    counts kill_trigger_errors; trigger must not count it as well."""
+    import sqlite3
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    ks = KillSwitch(db)
+    with pytest.raises(sqlite3.IntegrityError):
+        await ks.trigger(
+            triggered_by="not_a_valid_source", reason="x", duration=timedelta(hours=1)
+        )
+    cur = await db._conn.execute(
+        "SELECT COALESCE(SUM(value), 0) FROM live_metrics_daily "
+        "WHERE metric = 'kill_trigger_errors'"
+    )
+    assert (await cur.fetchone())[0] == 0
+    await db.close()

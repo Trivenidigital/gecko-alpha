@@ -4505,7 +4505,22 @@ class LaneRunner:
                 return
             except IllegalStateTransition:
                 continue  # the row moved under us; look again
-        # Moved twice, or is in a state that contradicts the landing.
+        # Moved twice. One last look: if it now records the landing there is
+        # nothing to add; otherwise (e.g. `failed`, which contradicts the
+        # resolver) let the write raise so the run stops loudly.
+        current = await load_execution(self._db, decision_id)
+        current_state = None if current is None else current.get("state")
+        if current_state in _ALREADY_LANDED_STATES and (
+            catch_up not in LEGAL_TRANSITIONS.get(current_state, ())
+        ):
+            evidence.record(
+                "catch_up_state_skipped",
+                wanted=catch_up,
+                current_state=current_state,
+                note="the execution row already records the landing "
+                "(most likely a concurrent `resolve`); not rewriting it",
+            )
+            return
         await self._state(decision_id, catch_up, mode=mode)
 
     async def _reconcile(

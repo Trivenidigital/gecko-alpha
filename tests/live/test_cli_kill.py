@@ -145,3 +145,24 @@ async def test_on_that_could_not_engage_exits_non_zero(tmp_path, monkeypatch, ca
     monkeypatch.setattr(sys, "argv", ["cli_kill", "--on", "ops test"])
     assert await cli_main() == 1
     assert "NOT engaged" in capsys.readouterr().out
+
+
+async def test_on_with_an_unreadable_kill_pointer_exits_cleanly(
+    tmp_path, monkeypatch, capsys
+):
+    db_path = tmp_path / "t.db"
+    db = Database(db_path)
+    await db.initialize()
+    kid, _ = await KillSwitch(db).trigger(
+        triggered_by="manual", reason="x", duration=timedelta(hours=1)
+    )
+    await db._conn.execute(
+        "UPDATE kill_events SET killed_until = 'garbage' WHERE id = ?", (kid,)
+    )
+    await db._conn.commit()
+    await db.close()
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setattr(sys, "argv", ["cli_kill", "--on", "again"])
+    assert await cli_main() == 1
+    out = capsys.readouterr().out
+    assert "cannot be read" in out
