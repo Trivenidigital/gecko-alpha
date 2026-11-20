@@ -4826,3 +4826,70 @@ async def test_adoption_does_not_crash_when_resolve_already_recorded_the_landing
     assert execution["state"] == solana_lane.STATE_LANDED
     await session.close()
     await db.close()
+
+
+async def test_adoption_that_contradicts_a_recorded_failure_stops_loudly(
+    tmp_path, monkeypatch
+):
+    """The resolver says landed, the row says failed. That is a
+    contradiction, not something to skip quietly."""
+
+    async def _row_marked_failed(db, decision_id):
+        await solana_lane.record_execution_state(
+            db, decision_id, solana_lane.STATE_FAILED, mode="SUPERVISED_LIVE"
+        )
+
+    code, db, session, steps, execution, submissions = (
+        await _run_confirm_timeout_then_adopted(
+            tmp_path,
+            monkeypatch,
+            resolver_status="finalized",
+            after_adoption=_row_marked_failed,
+        )
+    )
+    assert _step(steps, "catch_up_state_skipped") is None
+    assert _step(steps, "unexpected_error") is not None
+    assert code != EXIT_OK
+    assert execution["state"] == solana_lane.STATE_FAILED
+    await session.close()
+    await db.close()
+
+
+async def test_catch_up_rechecks_when_the_row_moves_between_check_and_write(
+    tmp_path, monkeypatch
+):
+    """The check reads the row, then the write's own guard reads it again.
+    If `resolve` lands in between, the write raises — caught once and
+    re-checked, so the run continues instead of dying."""
+    real_load = solana_lane.load_execution
+    stale = {"armed": False, "used": False}
+
+    async def _operator_resolve(db, decision_id):
+        await solana_lane.record_execution_state(
+            db, decision_id, solana_lane.STATE_LANDED, mode="SUPERVISED_LIVE"
+        )
+        stale["armed"] = True
+
+    async def _load(db, decision_id):
+        row = await real_load(db, decision_id)
+        if stale["armed"] and not stale["used"] and row is not None:
+            stale["used"] = True
+            return {**row, "state": solana_lane.STATE_SUBMISSION_ATTEMPTED}
+        return row
+
+    monkeypatch.setattr(solana_lane, "load_execution", _load)
+    code, db, session, steps, execution, submissions = (
+        await _run_confirm_timeout_then_adopted(
+            tmp_path,
+            monkeypatch,
+            resolver_status="confirmed",
+            after_adoption=_operator_resolve,
+        )
+    )
+    assert stale["used"], "the stale read was not exercised"
+    assert _step(steps, "unexpected_error") is None
+    assert _step(steps, "catch_up_state_skipped") is not None
+    assert code == EXIT_REVIEW
+    assert execution["state"] == solana_lane.STATE_LANDED
+    await session.close()
+    await db.close()

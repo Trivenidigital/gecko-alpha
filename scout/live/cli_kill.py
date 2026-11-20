@@ -87,8 +87,22 @@ async def main() -> int:
                 reason=args.on,
                 duration=compute_kill_duration(datetime.now(timezone.utc)),
             )
-            print(f"kill_event_id={kid} won={won}")
-            return 0
+            if won:
+                print(f"kill_event_id={kid} won=True")
+                return 0
+            still = await ks.is_active()
+            if still is not None:
+                # Another kill was already in force; trading is halted.
+                print(
+                    f"kill_event_id={still.kill_event_id} won=False (already engaged)"
+                )
+                return 0
+            print(
+                "NOT engaged — no kill is in force and this request did not "
+                "take effect; check the logs (live_kill_trigger_unconfirmed) "
+                "and run --on again"
+            )
+            return 1
         if args.off:
             cleared_id = await ks.clear(cleared_by="manual")
             if cleared_id is not None:

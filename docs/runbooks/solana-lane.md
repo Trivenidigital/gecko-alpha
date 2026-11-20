@@ -333,7 +333,7 @@ For `place`:
 | 1 | A gate refused, you did not authorize, or the transaction definitively did not execute | Read the reason. No position exists. |
 | 2 | Lane blocked — an unresolved prior signature, or another run holds the lock | Resolve what it names. Do not place anything. |
 | 3 | **Unresolved submission**, or an unexpected failure | State is UNKNOWN. See rule 1 below. |
-| 4 | The swap executed but the balance move could not be explained — or the transaction landed but was not finalized in time (finalize timeout, or adopted by the resolver at `confirmed`) | Check the wallet before the next run. Read the `reconciliation` record. A run left at `landed` blocks the lane, and `resolve` cannot move it on yet: once the signature is finalized on chain, settle the row by hand. |
+| 4 | The swap executed but the balance move could not be explained — or the transaction landed but was not finalized in time (finalize timeout, or adopted by the resolver at `confirmed`) | Check the wallet before the next run. Read the `reconciliation` record. A run left at `landed` blocks the lane, and `resolve` cannot move it on yet: once the signature is finalized on chain, settle the row by hand. If the evidence holds `catch_up_state_skipped`, a concurrent `resolve` had already recorded the landing; that step needs nothing more. |
 
 `resolve` reuses the same codes for its own verdict, so read them differently:
 

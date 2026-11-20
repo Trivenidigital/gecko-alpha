@@ -976,9 +976,12 @@ KILL_SWITCH = Machine(
         "as before. A killed_until that cannot be parsed is left in force "
         "and logged at ERROR (live_kill_dead_pointer_unreadable).",
         "Writers that do not take the transaction lock can roll back the "
-        "shared connection mid-trigger. trigger reads its claim back before "
-        "reporting a win and retries an attempt that was undone, up to three "
-        "times; after that it logs live_kill_trigger_unconfirmed.",
+        "shared connection mid-trigger. Each trigger attempt commits, then "
+        "reads the committed pointer back, and reports a win only for a "
+        "kill durably in force. An undone attempt is retried, three attempts "
+        "in all. If none engages a kill it logs live_kill_trigger_unconfirmed "
+        "at ERROR, sends a NOT ENGAGED alert and returns (None, False); the "
+        "kill CLI then exits 1.",
         "A pointer left on an already-cleared event matches no state: the "
         "switch reads as inactive. No automatic clear releases it; the next "
         "trigger does, and so does an operator clear. The auditor reports "

@@ -850,3 +850,158 @@ async def test_releasing_a_long_latched_kill_sends_the_latched_alert(tmp_path):
     assert any(f"#{old_id}" in a and "latched" in a for a in alerts)
     assert any("TRIGGERED" in a for a in alerts)
     await db.close()
+
+
+# --- vector re-review findings at 68417141 -----------------------------------
+
+
+def _patch_commit(db, behaviour):
+    """Replace the shared connection's commit. ``behaviour(n, real_commit)``
+    is awaited for the n-th call (1-based)."""
+    real_commit = db._conn.commit
+    calls = {"n": 0}
+
+    async def _commit():
+        calls["n"] += 1
+        await behaviour(calls["n"], real_commit)
+
+    db._conn.commit = _commit
+    return calls, real_commit
+
+
+async def test_a_rollback_just_before_the_commit_does_not_yield_a_phantom_win(
+    tmp_path,
+):
+    """A foreign rollback landing between the claim and the commit leaves
+    nothing to commit. The call must not report a win for a kill that never
+    landed; it must retry and engage for real."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    alerts: list[str] = []
+
+    async def _hook(text):
+        alerts.append(text)
+
+    ks = KillSwitch(db, alert_hook=_hook)
+    await _point_control_at(
+        db, killed_until=datetime.now(timezone.utc) - timedelta(minutes=5)
+    )
+
+    async def _rollback_then_commit_once(n, real_commit):
+        if n == 1:
+            await db._conn.rollback()  # an unlocked writer elsewhere
+        await real_commit()
+
+    _calls, real_commit = _patch_commit(db, _rollback_then_commit_once)
+    try:
+        new_id, won = await ks.trigger(
+            triggered_by="daily_loss_cap", reason="breach", duration=timedelta(hours=4)
+        )
+    finally:
+        db._conn.commit = real_commit
+
+    assert won is True
+    state = await ks.is_active()
+    assert state is not None and state.kill_event_id == new_id
+    assert sum("TRIGGERED" in a for a in alerts) == 1
+    await db.close()
+
+
+async def test_a_winner_whose_commit_raises_is_still_reported_as_the_winner(
+    tmp_path,
+):
+    """If the winning commit raises but the kill ends up engaged anyway, the
+    caller must hear that it won and the operator must get the alert."""
+    import sqlite3
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    alerts: list[str] = []
+
+    async def _hook(text):
+        alerts.append(text)
+
+    ks = KillSwitch(db, alert_hook=_hook)
+
+    async def _fail_first_commit(n, real_commit):
+        if n == 1:
+            raise sqlite3.OperationalError("database is locked")
+        await real_commit()
+
+    _calls, real_commit = _patch_commit(db, _fail_first_commit)
+    try:
+        new_id, won = await ks.trigger(
+            triggered_by="manual", reason="op", duration=timedelta(hours=1)
+        )
+    finally:
+        db._conn.commit = real_commit
+
+    assert won is True
+    state = await ks.is_active()
+    assert state is not None and state.kill_event_id == new_id
+    assert sum("TRIGGERED" in a for a in alerts) == 1
+    await db.close()
+
+
+async def test_a_kill_that_cannot_be_engaged_says_so_loudly(tmp_path):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    alerts: list[str] = []
+
+    async def _hook(text):
+        alerts.append(text)
+
+    ks = KillSwitch(db, alert_hook=_hook)
+
+    async def _always_rolled_back(n, real_commit):
+        await db._conn.rollback()
+        await real_commit()
+
+    _calls, real_commit = _patch_commit(db, _always_rolled_back)
+    try:
+        with structlog.testing.capture_logs() as logs:
+            active_id, won = await ks.trigger(
+                triggered_by="daily_loss_cap",
+                reason="breach",
+                duration=timedelta(hours=4),
+            )
+    finally:
+        db._conn.commit = real_commit
+
+    assert won is False
+    assert active_id is None  # nothing is in force; do not name a dead kill
+    assert await ks.is_active() is None
+    assert any("NOT ENGAGED" in a for a in alerts)
+    unconfirmed = [e for e in logs if e.get("event") == "live_kill_trigger_unconfirmed"]
+    assert unconfirmed and unconfirmed[0]["log_level"] == "error"
+    await db.close()
+
+
+async def test_the_latched_alert_survives_a_retried_attempt(tmp_path):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    alerts: list[str] = []
+
+    async def _hook(text):
+        alerts.append(text)
+
+    ks = KillSwitch(db, alert_hook=_hook)
+    old_id = await _point_control_at(
+        db, killed_until=datetime.now(timezone.utc) - timedelta(hours=3)
+    )
+    fired, real_execute = _rollback_once_after(db, "INSERT INTO kill_events")
+    try:
+        _new_id, won = await ks.trigger(
+            triggered_by="daily_loss_cap", reason="breach", duration=timedelta(hours=4)
+        )
+    finally:
+        db._conn.execute = real_execute
+
+    assert fired and won is True
+    assert any(f"#{old_id}" in a and "latched" in a for a in alerts)
+    cur = await db._conn.execute(
+        "SELECT cleared_at, cleared_by FROM kill_events WHERE id = ?", (old_id,)
+    )
+    cleared_at, cleared_by = await cur.fetchone()
+    assert cleared_at is not None and cleared_by == "auto_expired"
+    await db.close()

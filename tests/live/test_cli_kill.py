@@ -129,3 +129,19 @@ async def test_off_does_not_claim_cleared_while_a_kill_is_still_in_force(
     out = capsys.readouterr().out
     assert "NOT cleared" in out
     assert "cleared\n" != out[-8:]
+
+
+async def test_on_that_could_not_engage_exits_non_zero(tmp_path, monkeypatch, capsys):
+    db_path = tmp_path / "t.db"
+    db = Database(db_path)
+    await db.initialize()
+    await db.close()
+
+    async def _not_engaged(self, **kwargs):
+        return None, False
+
+    monkeypatch.setattr(KillSwitch, "trigger", _not_engaged)
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setattr(sys, "argv", ["cli_kill", "--on", "ops test"])
+    assert await cli_main() == 1
+    assert "NOT engaged" in capsys.readouterr().out
