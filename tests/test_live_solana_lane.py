@@ -4939,6 +4939,7 @@ async def test_catch_up_survives_the_row_moving_twice(tmp_path, monkeypatch):
     )
     assert stale["left"] == 0
     assert _step(steps, "unexpected_error") is None
+    assert _step(steps, "catch_up_state_skipped") is not None
     assert code == EXIT_REVIEW
     assert execution["state"] == solana_lane.STATE_LANDED
     await session.close()

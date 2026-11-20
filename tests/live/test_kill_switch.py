@@ -1322,3 +1322,203 @@ def test_attempt_timestamps_are_strictly_increasing():
 
     stamps = [_unique_utc_now() for _ in range(2000)]
     assert all(b > a for a, b in zip(stamps, stamps[1:]))
+
+
+# --- vector review findings at 57a93fc0 --------------------------------------
+
+
+async def test_a_pending_claim_made_durable_at_the_end_is_reported_as_the_win(
+    tmp_path,
+):
+    """Every attempt's commits fail; then the database frees up. The claim
+    left pending must be settled by trigger itself and reported as the win
+    it is (TRIGGERED, won=True) — not engaged silently by a later commit
+    after NOT ENGAGED went out."""
+    import sqlite3
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    alerts: list[str] = []
+
+    async def _hook(text):
+        alerts.append(text)
+
+    ks = KillSwitch(db, alert_hook=_hook)
+    attempt_commits = 3 * 4  # comfortably more than all three attempts use
+
+    async def _fail_then_work(n, real_commit):
+        if n <= attempt_commits and _in_trigger_attempts["on"]:
+            raise sqlite3.OperationalError("database is locked")
+        await real_commit()
+
+    _in_trigger_attempts = {"on": True}
+    real_trigger_attempt = ks._trigger_attempt_locked
+    calls = {"n": 0}
+
+    async def _attempt(**kwargs):
+        calls["n"] += 1
+        result = await real_trigger_attempt(**kwargs)
+        if calls["n"] == 3:  # the database frees up after the last attempt
+            _in_trigger_attempts["on"] = False
+        return result
+
+    ks._trigger_attempt_locked = _attempt
+    _calls, real_commit = _patch_commit(db, _fail_then_work)
+    try:
+        kid, won = await ks.trigger(
+            triggered_by="daily_loss_cap", reason="breach", duration=timedelta(hours=4)
+        )
+    finally:
+        db._conn.commit = real_commit
+
+    assert won is True
+    assert db._conn.in_transaction is False
+    await db._conn.rollback()
+    state = await ks.is_active()
+    assert state is not None and state.kill_event_id == kid
+    assert sum("TRIGGERED" in a for a in alerts) == 1
+    assert not any("NOT ENGAGED" in a for a in alerts)
+    await db.close()
+
+
+async def test_a_database_error_in_the_read_back_does_not_escape(tmp_path):
+    """The read-back that judges an attempt fails during every attempt (a
+    transient disk error), then recovers. The error must not escape
+    uncounted; the call must settle and report the kill it engaged."""
+    import sqlite3
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    alerts: list[str] = []
+
+    async def _hook(text):
+        alerts.append(text)
+
+    ks = KillSwitch(db, alert_hook=_hook)
+    real_execute = db._conn.execute
+    failures = {"left": 3}
+
+    async def _execute(sql, *args, **kwargs):
+        if (
+            sql.startswith("SELECT lc.active_kill_event_id, ke.id, ke.triggered_at")
+            and failures["left"] > 0
+        ):
+            failures["left"] -= 1
+            raise sqlite3.OperationalError("disk I/O error")
+        return await real_execute(sql, *args, **kwargs)
+
+    db._conn.execute = _execute
+    try:
+        kid, won = await ks.trigger(
+            triggered_by="manual", reason="op", duration=timedelta(hours=1)
+        )
+    finally:
+        db._conn.execute = real_execute
+
+    assert failures["left"] == 0
+    assert won is True
+    state = await ks.is_active()
+    assert state is not None and state.kill_event_id == kid
+    assert sum("TRIGGERED" in a for a in alerts) == 1
+    assert not any("NOT ENGAGED" in a for a in alerts)
+    await db.close()
+
+
+async def test_orphan_cleanup_never_deletes_another_writers_row_with_a_reused_id(
+    tmp_path,
+):
+    """Our insert is undone and its id is reused by another writer's row that
+    is NOT the pointer (a historical, cleared event). Cleanup keyed on id
+    alone would delete it."""
+    import sqlite3
+
+    dbp = tmp_path / "t.db"
+    db = Database(dbp)
+    await db.initialize()
+    ks = KillSwitch(db)
+    real_execute = db._conn.execute
+    state = {"done": False}
+
+    async def _execute(sql, *args, **kwargs):
+        cur = await real_execute(sql, *args, **kwargs)
+        if "INSERT INTO kill_events" in sql and not state["done"]:
+            state["done"] = True
+            await db._conn.rollback()
+            other = sqlite3.connect(dbp)
+            c = other.execute(
+                "INSERT INTO kill_events (triggered_by, reason, triggered_at, "
+                "killed_until, cleared_at, cleared_by) VALUES ('manual', "
+                "'history', '2020-01-01T00:00:00+00:00', "
+                "'2020-01-02T00:00:00+00:00', '2020-01-02T00:00:00+00:00', "
+                "'manual')"
+            )
+            state["other_id"] = c.lastrowid
+            other.commit()
+            other.close()
+        return cur
+
+    db._conn.execute = _execute
+    try:
+        _kid, won = await ks.trigger(
+            triggered_by="manual", reason="op", duration=timedelta(hours=1)
+        )
+    finally:
+        db._conn.execute = real_execute
+
+    assert won is True
+    cur = await db._conn.execute(
+        "SELECT reason FROM kill_events WHERE id = ?", (state["other_id"],)
+    )
+    row = await cur.fetchone()
+    assert row is not None and row[0] == "history"
+    await db.close()
+
+
+async def test_trigger_stays_correct_on_a_clock_that_repeats_itself(
+    tmp_path, monkeypatch
+):
+    """With a clock that returns the same instant every time, two concurrent
+    triggers' rows would share triggered_at and ownership could collide.
+    trigger must stamp attempts with _unique_utc_now, not the raw clock."""
+    from scout.live import kill_switch as ks_module
+
+    fixed = datetime(2030, 1, 1, tzinfo=timezone.utc)
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed
+
+    monkeypatch.setattr(ks_module, "datetime", _FrozenDatetime)
+    monkeypatch.setattr(ks_module, "_last_attempt_at", None)
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    alerts: list[str] = []
+
+    async def _hook(text):
+        alerts.append(text)
+
+    ks = KillSwitch(db, alert_hook=_hook)
+    real_execute = db._conn.execute
+    state = {"done": False}
+
+    async def _execute(sql, *args, **kwargs):
+        cur = await real_execute(sql, *args, **kwargs)
+        if "INSERT INTO kill_events" in sql and not state["done"]:
+            state["done"] = True
+            await db._conn.rollback()
+        return cur
+
+    db._conn.execute = _execute
+    try:
+        results = await asyncio.gather(
+            ks.trigger(triggered_by="manual", reason="A", duration=timedelta(hours=1)),
+            ks.trigger(triggered_by="manual", reason="B", duration=timedelta(hours=1)),
+        )
+    finally:
+        db._conn.execute = real_execute
+
+    assert sum(1 for r in results if r[1]) == 1, results
+    assert sum("TRIGGERED" in a for a in alerts) == 1
+    await db.close()

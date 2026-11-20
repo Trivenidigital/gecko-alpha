@@ -418,32 +418,13 @@ class KillSwitch:
                     await self._ensure_released_event_stamped_locked(released, now)
             last_error = error or last_error
             if verdict == "won":
-                log.warning(
-                    "live_kill_event_triggered",
-                    kill_event_id=event_id,
-                    triggered_by=triggered_by,
-                    reason=reason,
-                    killed_until=killed_until.isoformat(),
-                    attempts=attempt,
-                )
-                # §12b: notify the operator OUTSIDE the txn lock — the HTTP
-                # send must not hold the single DB writer. Winner-only.
-                if (
-                    released is not None
-                    and released[2] is not None
-                    and released[2] > _LATCHED_ALERT_THRESHOLD
-                ):
-                    await self._emit_alert(
-                        event_type="latched_auto_clear",
-                        kill_event_id=released[0],
-                        latched_hours=released[2].total_seconds() / 3600.0,
-                    )
-                await self._emit_alert(
-                    event_type="triggered",
-                    kill_event_id=event_id,
+                await self._announce_win(
+                    event_id=event_id,
+                    released=released,
                     triggered_by=triggered_by,
                     reason=reason,
                     killed_until=killed_until,
+                    attempts=attempt,
                 )
                 return event_id, True
             if verdict == "lost":
@@ -472,19 +453,50 @@ class KillSwitch:
                 error_type=None if error is None else type(error).__name__,
             )
 
-        # No attempt engaged a kill. With a write transaction still open
-        # (every commit failed), is_active() would read uncommitted state, so
-        # nothing can be confirmed in force.
-        unconfirmable = bool(self._db._conn.in_transaction)
+        # No attempt engaged a kill. If every commit failed, our claim may be
+        # sitting in an open transaction that the NEXT commit on this shared
+        # connection — anyone's, including the metric write below — would
+        # make durable. Settle it ourselves first: one more commit, and if it
+        # goes through, judge from committed state like any attempt.
+        conn = self._db._conn
+        pending: list[int] = []
+        async with self._db._txn_lock:
+            if conn.in_transaction:
+                await self._commit_or_log_locked(
+                    "trigger_final_settle", kill_event_ids=sorted(our_ids)
+                )
+            if not conn.in_transaction:
+                try:
+                    settled = await self._owned_pointer_locked(our_ids)
+                except sqlite3.Error as exc:
+                    settled, last_error = None, last_error or exc
+                if settled is not None:
+                    if released is not None:
+                        await self._ensure_released_event_stamped_locked(
+                            released, _unique_utc_now()
+                        )
+            else:
+                settled = None
+                # Still open: list the rows of ours it holds (a read inside
+                # the open transaction sees them), so the operator knows
+                # which claim may yet take effect.
+                pending = await self._our_rows_present_locked(our_ids)
+        if settled is not None:
+            await self._announce_win(
+                event_id=settled,
+                released=released,
+                triggered_by=triggered_by,
+                reason=reason,
+                killed_until=killed_until,
+                attempts=_TRIGGER_ATTEMPTS,
+            )
+            return settled, True
+        unconfirmable = bool(conn.in_transaction)
         try:
             state = None if unconfirmable else await self.is_active()
         except ValueError:  # an unreadable killed_until on the pointer
             state = None
         active_id = state.kill_event_id if state is not None else None
-        # Rows of ours that may still be sitting in an open transaction: the
-        # next successful commit on this connection (anyone's) would engage
-        # them, after this call has reported failure.
-        pending = sorted(our_ids) if unconfirmable else []
         log.error(
             "live_kill_trigger_unconfirmed",
             triggered_by=triggered_by,
@@ -500,13 +512,22 @@ class KillSwitch:
             # Counted here, once, for every caller: the engine's venue-fatal
             # kills and the CLI do not count failures themselves. The raised
             # error is marked so maybe_trigger_from_daily_loss does not count
-            # it again.
-            try:
-                from scout.live.metrics import inc
+            # it again. Skipped while a transaction is still open: the
+            # metric's commit would make the pending claim durable behind
+            # the alert's back.
+            if unconfirmable:
+                log.error(
+                    "live_kill_trigger_metric_skipped",
+                    why="transaction_left_open",
+                    pending_kill_event_ids=pending,
+                )
+            else:
+                try:
+                    from scout.live.metrics import inc
 
-                await inc(self._db, "kill_trigger_errors")
-            except Exception:  # noqa: BLE001 - the alert below must still go
-                log.exception("live_kill_trigger_metric_failed")
+                    await inc(self._db, "kill_trigger_errors")
+                except Exception:  # noqa: BLE001 - the alert below must still go
+                    log.exception("live_kill_trigger_metric_failed")
             note = None
             if pending:
                 note = (
@@ -609,13 +630,19 @@ class KillSwitch:
 
         # What is durably in force now? Committed state cannot be undone by a
         # later rollback, so this is the only safe basis for "won".
-        cur = await conn.execute(
-            "SELECT lc.active_kill_event_id, ke.id, ke.triggered_at "
-            "FROM live_control AS lc "
-            "LEFT JOIN kill_events AS ke ON ke.id = lc.active_kill_event_id "
-            "WHERE lc.id = 1"
-        )
-        row = await cur.fetchone()
+        try:
+            cur = await conn.execute(
+                "SELECT lc.active_kill_event_id, ke.id, ke.triggered_at "
+                "FROM live_control AS lc "
+                "LEFT JOIN kill_events AS ke ON ke.id = lc.active_kill_event_id "
+                "WHERE lc.id = 1"
+            )
+            row = await cur.fetchone()
+        except sqlite3.Error as exc:
+            # Nothing can be judged; the next attempt (or the final settle)
+            # reads again, and a persistent error surfaces through the
+            # NOT ENGAGED path.
+            return "retry", None, released, error or exc
         pointer = row[0] if row is not None else None
         if pointer is not None and row[1] == pointer and our_ids.get(pointer) == row[2]:
             return "won", pointer, released, error
@@ -643,9 +670,86 @@ class KillSwitch:
         await self._commit_or_log_locked(
             "trigger_orphan_cleanup", kill_event_ids=sorted(our_ids)
         )
-        if await self._pointer_is_dead_locked(now):
+        try:
+            dead = await self._pointer_is_dead_locked(now)
+        except sqlite3.Error as exc:
+            return "retry", None, released, error or exc
+        if dead:
             return "retry", None, released, error
         return "lost", pointer, released, error
+
+    async def _owned_pointer_locked(self, our_ids: dict[int, str]) -> int | None:
+        """The active event id if it is one of this call's rows (matched on id
+        AND triggered_at), else None. Caller holds the txn lock and has no
+        transaction open, so this reads committed state."""
+        conn = self._db._conn
+        assert conn is not None
+        cur = await conn.execute(
+            "SELECT lc.active_kill_event_id, ke.id, ke.triggered_at "
+            "FROM live_control AS lc "
+            "LEFT JOIN kill_events AS ke ON ke.id = lc.active_kill_event_id "
+            "WHERE lc.id = 1"
+        )
+        row = await cur.fetchone()
+        if row is None or row[0] is None or row[1] != row[0]:
+            return None
+        return row[0] if our_ids.get(row[0]) == row[2] else None
+
+    async def _our_rows_present_locked(self, our_ids: dict[int, str]) -> list[int]:
+        """Which of this call's rows exist as this connection sees them —
+        including uncommitted work in an open transaction."""
+        conn = self._db._conn
+        assert conn is not None
+        present: list[int] = []
+        for event_id, at in sorted(our_ids.items()):
+            try:
+                cur = await conn.execute(
+                    "SELECT 1 FROM kill_events WHERE id = ? AND triggered_at = ?",
+                    (event_id, at),
+                )
+                if await cur.fetchone() is not None:
+                    present.append(event_id)
+            except sqlite3.Error:
+                present.append(event_id)  # unknown: say it may be pending
+        return present
+
+    async def _announce_win(
+        self,
+        *,
+        event_id: int,
+        released: tuple[int, str, timedelta | None] | None,
+        triggered_by: str,
+        reason: str,
+        killed_until: datetime,
+        attempts: int,
+    ) -> None:
+        log.warning(
+            "live_kill_event_triggered",
+            kill_event_id=event_id,
+            triggered_by=triggered_by,
+            reason=reason,
+            killed_until=killed_until.isoformat(),
+            attempts=attempts,
+        )
+        # §12b: notify the operator OUTSIDE the txn lock — the HTTP send must
+        # not hold the single DB writer. Winner-only.
+        if (
+            released is not None
+            and released[2] is not None
+            and released[2] > _LATCHED_ALERT_THRESHOLD
+        ):
+            await self._emit_alert(
+                event_type="latched_auto_clear",
+                kill_event_id=released[0],
+                latched_hours=released[2].total_seconds() / 3600.0,
+            )
+        await self._emit_alert(
+            event_type="triggered",
+            kill_event_id=event_id,
+            triggered_by=triggered_by,
+            reason=reason,
+            killed_until=killed_until,
+        )
 
     async def _ensure_released_event_stamped_locked(
         self, released: tuple[int, str, timedelta | None], now: datetime
