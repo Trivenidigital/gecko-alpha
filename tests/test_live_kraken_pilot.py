@@ -2530,6 +2530,9 @@ async def test_cancel_after_an_exit_says_the_position_still_blocks(tmp_path, cap
         ("0.00000000", None, True),  # a recorded zero is not a fill
         ("", None, True),
         ("abc", None, False),  # unreadable: do not assume "no fill"
+        (".", None, False),  # no digit at all: unreadable, not zero
+        ("0.0.0", None, False),  # two decimal points: unreadable
+        ("-0", None, False),  # signs never come from _fmt: treat as unreadable
         (None, "100.00", False),  # a price without a quantity is still a fill
         ("0.10000000", "100.00", False),
     ],

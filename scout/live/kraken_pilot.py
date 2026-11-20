@@ -292,13 +292,17 @@ _BLOCKING_STATUSES = ("open", "needs_manual_review")
 # exit's txid was not known (_record_partial_exit accepts txid=None).
 _NO_EXIT_RECORDED = "exit_order_id IS NULL AND exit_fill_price IS NULL"
 # "No entry fill" means no price, and a quantity that is absent, blank or a
-# plain zero ("0", "0.00000000" — _fmt writes fixed-point). Anything else,
-# including a value that cannot be read as a number, counts as a recorded
-# fill: CAST would turn 'abc' into 0 and wave it through.
+# plain zero ("0", "0.00000000" — _fmt writes fixed-point): digits and at most
+# one decimal point, at least one digit, and no digit other than 0. Anything
+# else, including a value that cannot be read as a number (".", "0.0.0",
+# "abc", "-0"), counts as a recorded fill: CAST would turn 'abc' into 0 and
+# wave it through.
 _NO_ENTRY_FILL_RECORDED = (
     "entry_fill_price IS NULL AND ("
     "entry_fill_qty IS NULL OR TRIM(entry_fill_qty) = '' OR ("
     "TRIM(entry_fill_qty) NOT GLOB '*[^0-9.]*' "
+    "AND TRIM(entry_fill_qty) GLOB '*[0-9]*' "
+    "AND TRIM(entry_fill_qty) NOT GLOB '*.*.*' "
     "AND TRIM(entry_fill_qty) NOT GLOB '*[1-9]*'))"
 )
 
