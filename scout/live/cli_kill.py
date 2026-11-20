@@ -87,12 +87,46 @@ async def main() -> int:
                 reason=args.on,
                 duration=compute_kill_duration(datetime.now(timezone.utc)),
             )
-            print(f"kill_event_id={kid} won={won}")
-            return 0
+            if won:
+                print(f"kill_event_id={kid} won=True")
+                return 0
+            try:
+                still = await ks.is_active()
+            except ValueError:
+                print(
+                    "NOT engaged — the active kill's killed_until cannot be "
+                    "read, so whether trading is halted is unknown; inspect "
+                    "kill_events by hand"
+                )
+                return 1
+            if still is not None:
+                # Another kill was already in force; trading is halted.
+                print(
+                    f"kill_event_id={still.kill_event_id} won=False (already engaged)"
+                )
+                return 0
+            print(
+                "NOT engaged — no kill is in force and this request did not "
+                "take effect; check the logs (live_kill_trigger_unconfirmed) "
+                "and run --on again"
+            )
+            return 1
         if args.off:
-            await ks.clear(cleared_by="manual")
-            print("cleared")
-            return 0
+            cleared_id = await ks.clear(cleared_by="manual")
+            if cleared_id is not None:
+                print(f"cleared kill_event_id={cleared_id}")
+                return 0
+            still = await ks.is_active()
+            if still is None:
+                print("nothing to clear — the kill switch is already inactive")
+                return 0
+            # Nothing was cleared, yet a kill is in force: another process
+            # engaged one while this command ran. Do not report success.
+            print(
+                f"NOT cleared — kill_event_id={still.kill_event_id} is in force "
+                f"until {still.killed_until.isoformat()}; run --off again"
+            )
+            return 1
         if args.status:
             state = await ks.is_active()
             if state is None:

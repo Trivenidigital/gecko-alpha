@@ -22,6 +22,9 @@ TradeStatus = Literal[
     "closed_moonshot_trail",  # BL-063
     "closed_floor",
     "closed_peak_fade",
+    "closed_high_peak_fade",
+    "closed_momentum_death",
+    "closed_time_death",
     "closed_manual",
     "closed_stale_onset",  # Phase 6 slice 3 — stale-onset exit at last-good mark
 ]

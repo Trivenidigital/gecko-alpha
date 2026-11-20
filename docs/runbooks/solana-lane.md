@@ -332,8 +332,8 @@ For `place`:
 | 0 | The swap landed and reconciled, or nothing was outstanding | Nothing. The USDC is yours to dispose of; the ledger row stays `open` until you do. |
 | 1 | A gate refused, you did not authorize, or the transaction definitively did not execute | Read the reason. No position exists. |
 | 2 | Lane blocked — an unresolved prior signature, or another run holds the lock | Resolve what it names. Do not place anything. |
-| 3 | **Unresolved submission**, or an unexpected failure | State is UNKNOWN. See rule 1 below. |
-| 4 | The swap executed but the balance move could not be explained | Check the wallet before the next run. Read the `reconciliation` record. |
+| 3 | **Unresolved submission**, or an unexpected failure | State is UNKNOWN. See rule 1 below. **Exception:** if the error is `IllegalStateTransition` naming a move from `failed`, the resolver found the swap landed but the execution row already says `failed` (a concurrent `resolve` disagreed). Both rows are terminal, so the lane is **not** blocked and holds a position it does not record: do not `place`; run `resolve` (it should report `landed`), dispose of the output token and settle the rows by hand. |
+| 4 | The swap executed but the balance move could not be explained — or the transaction landed but was not finalized in time (finalize timeout, or adopted by the resolver at `confirmed`) | Check the wallet before the next run. Read the `reconciliation` record. A run left at `landed` blocks the lane, and `resolve` cannot move it on yet: once the signature is finalized on chain, settle the row by hand. If the evidence holds `catch_up_state_skipped`, a concurrent `resolve` had already recorded the landing; that step needs nothing more. |
 
 `resolve` reuses the same codes for its own verdict, so read them differently:
 

@@ -478,6 +478,11 @@ BLOCKING_STATES = (
 # illegal jump — say awaiting_authorization straight to submission_attempted,
 # which would mean submitting something nobody approved — is a loud error at
 # the write, not a silent state a later reader has to make sense of.
+# States that already record that a forward run's transaction landed. A
+# post-adoption catch-up that finds the row in one of these has nothing to add.
+_ALREADY_LANDED_STATES = frozenset(
+    {STATE_LANDED, STATE_CONFIRMED, STATE_FINALIZED, STATE_RECONCILED}
+)
 LEGAL_TRANSITIONS: dict[str, tuple[str, ...]] = {
     STATE_QUOTE_CREATED: (STATE_TRANSACTION_BUILT, STATE_FAILED),
     STATE_TRANSACTION_BUILT: (STATE_SIMULATION_PASSED, STATE_FAILED),
@@ -4359,6 +4364,29 @@ class LaneRunner:
             confirmation["outcome"] = "landed_after_resolution"
             confirmation["slot"] = resolution.slot
             confirmation["confirmation_status"] = resolution.confirmation_status
+            # The state machine has to catch up with what the resolver found
+            # before reconciliation can advance it: the run is still at
+            # `submission_attempted`, from which `reconciled` is not reachable
+            # — and must not be, or a run could reconcile without ever
+            # recording that its transaction landed. Same catch-up, for the
+            # same reason, as the reverse path's.
+            #
+            # `resolve` runs without the lane lock, so an operator may already
+            # have recorded the landing between adoption and here. Write the
+            # catch-up only if the lane's own table allows it from the state
+            # the row is in NOW; otherwise the row already says at least as
+            # much, and writing would raise IllegalStateTransition.
+            catch_up = (
+                STATE_FINALIZED
+                if resolution.confirmation_status == "finalized"
+                else STATE_LANDED
+            )
+            await self._catch_up_after_adoption(
+                evidence=evidence,
+                decision_id=decision_id,
+                catch_up=catch_up,
+                mode=mode,
+            )
 
         transaction = None
         try:
@@ -4432,6 +4460,74 @@ class LaneRunner:
         # itself completed: money moved in a way the runner cannot account
         # for, and a 0 here would tell a wrapper script everything is fine.
         return EXIT_REVIEW if summary["verdict"] == "review" else EXIT_OK
+
+    async def _catch_up_after_adoption(
+        self,
+        *,
+        evidence: EvidenceLog,
+        decision_id: str,
+        catch_up: str,
+        mode: str,
+    ) -> None:
+        """Record the landing the resolver found, unless the row already says
+        it — a concurrent ``resolve`` (which runs without the lane lock) may
+        have recorded it first.
+
+        Skipped only when the row is already at or past a landing
+        (``_ALREADY_LANDED_STATES``). Any other state that cannot reach the
+        catch-up — ``failed`` above all, which contradicts the resolver's
+        "landed" — is left to raise, so the run stops loudly. If the row
+        moves between this check and the write, the write's own guard
+        raises; that is caught once and re-checked.
+        """
+        for _ in range(2):
+            current = await load_execution(self._db, decision_id)
+            current_state = None if current is None else current.get("state")
+            if current_state in _ALREADY_LANDED_STATES and (
+                catch_up not in LEGAL_TRANSITIONS.get(current_state, ())
+            ):
+                evidence.record(
+                    "catch_up_state_skipped",
+                    wanted=catch_up,
+                    current_state=current_state,
+                    note="the execution row already records the landing "
+                    "(most likely a concurrent `resolve`); not rewriting it",
+                )
+                log.info(
+                    "solana_lane_catch_up_state_skipped",
+                    decision_id=decision_id,
+                    wanted=catch_up,
+                    current_state=current_state,
+                )
+                return
+            try:
+                await self._state(decision_id, catch_up, mode=mode)
+                return
+            except IllegalStateTransition:
+                continue  # the row moved under us; look again
+        # Moved twice. One last look: if it now records the landing there is
+        # nothing to add; otherwise (e.g. `failed`, which contradicts the
+        # resolver) let the write raise so the run stops loudly.
+        current = await load_execution(self._db, decision_id)
+        current_state = None if current is None else current.get("state")
+        if current_state in _ALREADY_LANDED_STATES and (
+            catch_up not in LEGAL_TRANSITIONS.get(current_state, ())
+        ):
+            evidence.record(
+                "catch_up_state_skipped",
+                wanted=catch_up,
+                current_state=current_state,
+                note="the execution row already records the landing "
+                "(most likely a concurrent `resolve`); not rewriting it",
+            )
+            log.info(
+                "solana_lane_catch_up_state_skipped",
+                decision_id=decision_id,
+                wanted=catch_up,
+                current_state=current_state,
+            )
+            return
+        await self._state(decision_id, catch_up, mode=mode)
 
     async def _reconcile(
         self,
@@ -4551,6 +4647,18 @@ class LaneRunner:
             mismatches.append(
                 "the transaction confirmed but was not finalized inside the "
                 "window — it is landed but not yet rooted"
+            )
+        elif confirmation["outcome"] == "landed_after_resolution" and not _is_finalized(
+            confirmation
+        ):
+            # The same fact as finalize_timeout, reached through the
+            # resolver: a fork can still take this back. A `pass` here would
+            # also try to advance `landed` straight to `reconciled`, which
+            # the transition table forbids.
+            mismatches.append(
+                "the resolver found the transaction landed but not finalized "
+                f"(status {confirmation.get('confirmation_status')!r}) — it "
+                "is landed but not yet rooted"
             )
 
         # ---- the position, and what it cost to open ----

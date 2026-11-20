@@ -116,3 +116,99 @@ def test_no_active_kill_is_clean(tmp_path):
 def test_missing_db_returns_error(tmp_path):
     mod = _load_script()
     assert mod.main(["--db", str(tmp_path / "nope.db")]) == 1
+
+
+def test_apply_does_not_clear_a_kill_engaged_after_the_expired_one_was_found(
+    tmp_path,
+):
+    """The pipeline is another process. If it engages a fresh kill between
+    this script finding the expired one and clearing it, the fresh kill must
+    stay in force."""
+    import aiosqlite
+    from datetime import datetime, timezone
+
+    mod = _load_script()
+    dbp = tmp_path / "t.db"
+    old_id = asyncio.run(_setup_kill(dbp, hours_delta=-2))
+
+    async def _race():
+        db = Database(dbp)
+        await db.initialize()
+        try:
+            new_id, won = await KillSwitch(db).trigger(
+                triggered_by="daily_loss_cap",
+                reason="fresh breach",
+                duration=timedelta(hours=4),
+            )
+            assert won is True
+        finally:
+            await db.close()
+        async with aiosqlite.connect(dbp) as conn:
+            applied = await mod._apply_clear(conn, old_id, datetime.now(timezone.utc))
+            cur = await conn.execute(
+                "SELECT active_kill_event_id FROM live_control WHERE id = 1"
+            )
+            pointer = (await cur.fetchone())[0]
+        return new_id, applied, pointer
+
+    new_id, applied, pointer = asyncio.run(_race())
+    assert applied is False
+    assert pointer == new_id
+
+
+def test_superseded_and_not_expired_results_name_their_reason(tmp_path, monkeypatch):
+    """The result's `reason` says why nothing was done. The kill's own reason
+    text must not overwrite it."""
+    mod = _load_script()
+    dbp = tmp_path / "expired.db"
+    asyncio.run(_setup_kill(dbp, hours_delta=-2))
+
+    async def _not_applied(conn, kill_event_id, now):
+        return False
+
+    monkeypatch.setattr(mod, "_apply_clear", _not_applied)
+    result = asyncio.run(mod._run(str(dbp), apply=True))
+    assert result["action"] == "none"
+    assert result["reason"] == "kill_superseded"
+
+    fresh = tmp_path / "fresh.db"
+    asyncio.run(_setup_kill(fresh, hours_delta=2))
+    result = asyncio.run(mod._run(str(fresh), apply=True))
+    assert result["action"] == "none"
+    assert result["reason"] == "kill_not_expired"
+
+
+def test_every_result_carries_the_kills_own_reason_under_one_key(tmp_path):
+    mod = _load_script()
+    dbp = tmp_path / "t.db"
+    asyncio.run(_setup_kill(dbp, hours_delta=-2))
+    dry = asyncio.run(mod._run(str(dbp), apply=False))
+    assert dry["kill_reason"] == "x"
+    done = asyncio.run(mod._run(str(dbp), apply=True))
+    assert done["action"] == "cleared"
+    assert done["kill_reason"] == "x"
+
+
+def test_superseded_result_says_what_is_in_force_now(tmp_path):
+    mod = _load_script()
+    dbp = tmp_path / "t.db"
+    old_id = asyncio.run(_setup_kill(dbp, hours_delta=-2))
+
+    async def _supersede_then_apply(conn, kill_event_id, now):
+        db = Database(dbp)
+        await db.initialize()
+        try:
+            new_id, _ = await KillSwitch(db).trigger(
+                triggered_by="manual", reason="fresh", duration=timedelta(hours=4)
+            )
+        finally:
+            await db.close()
+        _supersede_then_apply.new_id = new_id
+        return await real_apply(conn, kill_event_id, now)
+
+    real_apply = mod._apply_clear
+    mod._apply_clear = _supersede_then_apply
+    result = asyncio.run(mod._run(str(dbp), apply=True))
+    assert result["reason"] == "kill_superseded"
+    assert result["kill_event_id"] == old_id
+    assert result["active_kill_event_id_now"] == _supersede_then_apply.new_id

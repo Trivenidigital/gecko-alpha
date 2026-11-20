@@ -4692,3 +4692,255 @@ def test_solana_lane_defaults_are_safe():
 def test_runner_config_rejects_an_envelope_that_could_never_trade(overrides, fragment):
     with pytest.raises(ValueError, match=re.escape(fragment)):
         Settings(_env_file=None, **_REQUIRED, **overrides)
+
+
+# ======================================================================
+# Confirmation timeout, then the resolver finds the transaction landed
+# ======================================================================
+# Distinct from the ambiguous-SUBMISSION tests above: here the submit call
+# succeeded and it is the confirmation poll that never saw the signature. The
+# resolver then adopts the landing. The run is still at `submission_attempted`
+# at that point, and `reconciled` is not reachable from there — so before the
+# catch-up state was recorded, a reconciliation that passed ended in
+# IllegalStateTransition instead of a result.
+async def _run_confirm_timeout_then_adopted(
+    tmp_path, monkeypatch, *, resolver_status, after_adoption=None
+):
+    tx = build_swap_tx().tx_b64
+    _authorize(monkeypatch, _phrase(tx))
+    runner, db, session = await _make_runner(tmp_path)
+
+    async def _never_seen(_signature: str) -> dict:
+        return {
+            "outcome": "confirm_timeout",
+            "polls": 3,
+            "poll_errors": [],
+            "known": False,
+            "slot": None,
+            "confirmation_status": None,
+            "err": None,
+            "confirm_timeout_sec": 0.05,
+            "finalize_timeout_sec": 0.05,
+        }
+
+    monkeypatch.setattr(runner, "_await_confirmation", _never_seen)
+    if after_adoption is not None:
+        real_handle = runner._handle_ambiguity
+
+        async def _handle_then_interfere(**kwargs):
+            result = await real_handle(**kwargs)
+            await after_adoption(db, kwargs["decision_id"])
+            return result
+
+        monkeypatch.setattr(runner, "_handle_ambiguity", _handle_then_interfere)
+    with aioresponses() as m:
+        _mock_quote_and_build(m, tx)
+        _mock_pre_approval_rpc(m)
+        _mock_post_approval_rpc(m)
+        m.post(_SUBMIT_RE, payload=_rpc(_expected_signature(tx)))
+        # the resolver finds the signature, and records balances as evidence
+        m.post(_RPC_URL, payload=_sig_status(status=resolver_status))
+        m.post(_RPC_URL, payload=_rpc({"context": {"slot": 1}, "value": _SOL_AFTER}))
+        m.post(_RPC_URL, payload=_token_accounts(0))
+        m.post(_RPC_URL, payload=_token_accounts(_OUT_RAW))
+        # getTransaction, then the post-trade balances reconciliation reads
+        m.post(
+            _RPC_URL,
+            payload=_rpc({"slot": 283_000_455, "meta": {"fee": _TX_FEES, "err": None}}),
+        )
+        m.post(_RPC_URL, payload=_rpc({"context": {"slot": 1}, "value": _SOL_AFTER}))
+        m.post(_RPC_URL, payload=_token_accounts(_OUT_RAW))
+        code = await runner.place(sol=_SOL)
+        submissions = _submissions(m)
+    steps = _steps(tmp_path)
+    execution = await solana_lane.load_execution(
+        db, _step(steps, "run_started")["decision_id"]
+    )
+    return code, db, session, steps, execution, submissions
+
+
+async def test_confirm_timeout_then_finalized_adoption_reconciles(
+    tmp_path, monkeypatch
+):
+    code, db, session, steps, execution, submissions = (
+        await _run_confirm_timeout_then_adopted(
+            tmp_path, monkeypatch, resolver_status="finalized"
+        )
+    )
+    assert _step(steps, "confirmation_timeout") is not None
+    assert _step(steps, "ambiguity_adopted") is not None
+    assert len(submissions) == 1  # adopted, never resubmitted
+    assert _step(steps, "reconciliation")["verdict"] == "pass"
+    assert code == EXIT_OK
+    assert execution["state"] == solana_lane.STATE_RECONCILED
+    assert (await _live_rows(db))[0][0] == "open"
+    await session.close()
+    await db.close()
+
+
+async def test_confirm_timeout_then_unrooted_adoption_is_review_not_reconciled(
+    tmp_path, monkeypatch
+):
+    """Adopted but only 'confirmed': a fork can still take it back. That is
+    the same fact as finalize_timeout and gets the same answer — the state
+    records the landing and stops there."""
+    code, db, session, steps, execution, submissions = (
+        await _run_confirm_timeout_then_adopted(
+            tmp_path, monkeypatch, resolver_status="confirmed"
+        )
+    )
+    assert _step(steps, "ambiguity_adopted") is not None
+    assert len(submissions) == 1
+    reconciliation = _step(steps, "reconciliation")
+    assert reconciliation["verdict"] == "review"
+    assert any("not finalized" in m for m in reconciliation["mismatches"])
+    assert code == EXIT_REVIEW
+    assert execution["state"] == solana_lane.STATE_LANDED
+    assert (await _live_rows(db))[0][0] == "open"
+    await session.close()
+    await db.close()
+
+
+async def test_adoption_does_not_crash_when_resolve_already_recorded_the_landing(
+    tmp_path, monkeypatch
+):
+    """`resolve` deliberately runs without the lane lock. If an operator's
+    resolve records `landed` while this run is between adoption and its own
+    catch-up write, the catch-up must not attempt `landed -> landed`."""
+
+    async def _operator_resolve(db, decision_id):
+        await solana_lane.record_execution_state(
+            db, decision_id, solana_lane.STATE_LANDED, mode="SUPERVISED_LIVE"
+        )
+
+    code, db, session, steps, execution, submissions = (
+        await _run_confirm_timeout_then_adopted(
+            tmp_path,
+            monkeypatch,
+            resolver_status="confirmed",
+            after_adoption=_operator_resolve,
+        )
+    )
+    assert _step(steps, "unexpected_error") is None
+    assert code == EXIT_REVIEW
+    assert execution["state"] == solana_lane.STATE_LANDED
+    await session.close()
+    await db.close()
+
+
+async def test_adoption_that_contradicts_a_recorded_failure_stops_loudly(
+    tmp_path, monkeypatch
+):
+    """The resolver says landed, the row says failed. That is a
+    contradiction, not something to skip quietly."""
+
+    async def _row_marked_failed(db, decision_id):
+        await solana_lane.record_execution_state(
+            db, decision_id, solana_lane.STATE_FAILED, mode="SUPERVISED_LIVE"
+        )
+
+    code, db, session, steps, execution, submissions = (
+        await _run_confirm_timeout_then_adopted(
+            tmp_path,
+            monkeypatch,
+            resolver_status="finalized",
+            after_adoption=_row_marked_failed,
+        )
+    )
+    assert _step(steps, "catch_up_state_skipped") is None
+    assert _step(steps, "unexpected_error") is not None
+    assert code != EXIT_OK
+    assert execution["state"] == solana_lane.STATE_FAILED
+    await session.close()
+    await db.close()
+
+
+async def test_catch_up_rechecks_when_the_row_moves_between_check_and_write(
+    tmp_path, monkeypatch
+):
+    """The check reads the row, then the write's own guard reads it again.
+    If `resolve` lands in between, the write raises — caught once and
+    re-checked, so the run continues instead of dying."""
+    real_load = solana_lane.load_execution
+    stale = {"armed": False, "used": False}
+
+    async def _operator_resolve(db, decision_id):
+        await solana_lane.record_execution_state(
+            db, decision_id, solana_lane.STATE_LANDED, mode="SUPERVISED_LIVE"
+        )
+        stale["armed"] = True
+
+    async def _load(db, decision_id):
+        import sys
+
+        row = await real_load(db, decision_id)
+        caller = sys._getframe(1).f_code.co_name
+        if (
+            caller == "_catch_up_after_adoption"
+            and stale["armed"]
+            and not stale["used"]
+            and row is not None
+        ):
+            stale["used"] = True
+            return {**row, "state": solana_lane.STATE_SUBMISSION_ATTEMPTED}
+        return row
+
+    monkeypatch.setattr(solana_lane, "load_execution", _load)
+    code, db, session, steps, execution, submissions = (
+        await _run_confirm_timeout_then_adopted(
+            tmp_path,
+            monkeypatch,
+            resolver_status="confirmed",
+            after_adoption=_operator_resolve,
+        )
+    )
+    assert stale["used"], "the stale read was not exercised"
+    assert _step(steps, "unexpected_error") is None
+    assert _step(steps, "catch_up_state_skipped") is not None
+    assert code == EXIT_REVIEW
+    assert execution["state"] == solana_lane.STATE_LANDED
+    await session.close()
+    await db.close()
+
+
+async def test_catch_up_survives_the_row_moving_twice(tmp_path, monkeypatch):
+    real_load = solana_lane.load_execution
+    stale = {"armed": False, "left": 2}
+
+    async def _operator_resolve(db, decision_id):
+        await solana_lane.record_execution_state(
+            db, decision_id, solana_lane.STATE_LANDED, mode="SUPERVISED_LIVE"
+        )
+        stale["armed"] = True
+
+    async def _load(db, decision_id):
+        import sys
+
+        row = await real_load(db, decision_id)
+        caller = sys._getframe(1).f_code.co_name
+        if (
+            caller == "_catch_up_after_adoption"
+            and stale["armed"]
+            and stale["left"] > 0
+            and row is not None
+        ):
+            stale["left"] -= 1
+            return {**row, "state": solana_lane.STATE_SUBMISSION_ATTEMPTED}
+        return row
+
+    monkeypatch.setattr(solana_lane, "load_execution", _load)
+    code, db, session, steps, execution, submissions = (
+        await _run_confirm_timeout_then_adopted(
+            tmp_path,
+            monkeypatch,
+            resolver_status="confirmed",
+            after_adoption=_operator_resolve,
+        )
+    )
+    assert stale["left"] == 0
+    assert _step(steps, "unexpected_error") is None
+    assert _step(steps, "catch_up_state_skipped") is not None
+    assert code == EXIT_REVIEW
+    assert execution["state"] == solana_lane.STATE_LANDED
+    await session.close()
+    await db.close()

@@ -2219,3 +2219,349 @@ class TestEntryFreshStateRecheck:
         assert snapshot["price"] and snapshot["volume"]
         assert snapshot["available_balance"]
         assert step["approved_digest"]
+
+
+# ======================================================================
+# Cancel — the ledger write is guarded on the row's status
+# ======================================================================
+# The venue cancel is deliberately never refused (it reduces exposure). The
+# ledger write is a different matter: 'rejected' means "the entry produced no
+# position", so it may only be written over a row that still stands for an
+# order that may be live. Before this guard, cancelling the decision id of a
+# closed trade relabelled the closed row 'rejected' and re-stamped closed_at.
+_CLOSED_AT = "2026-10-01T00:00:00+00:00"
+
+
+def _mock_cancel_venue(m, *, vol_exec: str, cost: str) -> None:
+    m.post(_CANCEL_URL, payload={"error": [], "result": {"count": 0}})
+    m.post(_OPEN_ORDERS_URL, payload={"error": [], "result": {"open": {}}}, repeat=True)
+    m.post(
+        _CLOSED_ORDERS_URL,
+        payload={
+            "error": [],
+            "result": {
+                "closed": {
+                    _TXID: _filled_order_row(
+                        status="canceled", vol_exec=vol_exec, cost=cost
+                    )
+                }
+            },
+        },
+        repeat=True,
+    )
+    m.post(_QUERY_ORDERS_URL, payload={"error": [], "result": {}}, repeat=True)
+    m.post(_BALANCE_EX_URL, payload=_balance_payload(), repeat=True)
+
+
+async def _seed_settled_row(db: Database, *, status: str) -> int:
+    live_id = await _seed_kraken_row(
+        db,
+        size_usd="15.00",
+        status=status,
+        client_order_id=_DECISION,
+        entry_order_id=_TXID,
+    )
+    await db._conn.execute(
+        "UPDATE live_trades SET closed_at = ?, entry_fill_qty = '0.10000000', "
+        "entry_fill_price = '100.00' WHERE id = ?",
+        (_CLOSED_AT, live_id),
+    )
+    await db._conn.commit()
+    return live_id
+
+
+async def _ledger(db: Database, live_id: int) -> tuple:
+    cur = await db._conn.execute(
+        "SELECT status, closed_at, entry_fill_qty, entry_fill_price "
+        "FROM live_trades WHERE id = ?",
+        (live_id,),
+    )
+    return tuple(await cur.fetchone())
+
+
+@pytest.mark.parametrize("status", ["closed_via_reconciliation", "rejected"])
+async def test_cancel_does_not_relabel_a_settled_row(tmp_path, status):
+    runner, db, adapter = await _make_runner(tmp_path)
+    live_id = await _seed_settled_row(db, status=status)
+    before = await _ledger(db, live_id)
+
+    with aioresponses() as m:
+        _mock_cancel_venue(m, vol_exec="0.00000000", cost="0.00000")
+        assert await runner.cancel(decision_id=_DECISION) == EXIT_OK
+        # The safety lever is intact: the venue cancel was still sent.
+        assert len(_posts_to(m, _CANCEL_URL)) == 1
+
+    assert await _ledger(db, live_id) == before
+    steps = _evidence_steps(tmp_path)
+    unchanged = _step(steps, "cancel_ledger_unchanged")
+    assert unchanged is not None
+    assert unchanged["ledger_status"] == status
+    assert _step(steps, "cancel_zero_fill") is None
+    await adapter.close()
+    await db.close()
+
+
+async def test_cancel_does_not_overwrite_fills_on_a_settled_row(tmp_path):
+    """The partial-fill branch rewrites entry_fill_* — on a closed row that
+    would replace the recorded entry with the cancel-time lookup."""
+    runner, db, adapter = await _make_runner(tmp_path)
+    live_id = await _seed_settled_row(db, status="closed_via_reconciliation")
+    before = await _ledger(db, live_id)
+
+    with aioresponses() as m:
+        _mock_cancel_venue(m, vol_exec="0.05000000", cost="5.00000")
+        assert await runner.cancel(decision_id=_DECISION) == EXIT_OK
+
+    assert await _ledger(db, live_id) == before
+    steps = _evidence_steps(tmp_path)
+    assert _step(steps, "cancel_ledger_unchanged") is not None
+    assert _step(steps, "cancel_partial_fill") is None
+    await adapter.close()
+    await db.close()
+
+
+async def test_cancel_still_settles_a_row_under_manual_review(tmp_path):
+    """Cancelling a needs_manual_review row is the documented way out of it."""
+    runner, db, adapter = await _make_runner(tmp_path)
+    live_id = await _seed_kraken_row(
+        db,
+        size_usd="15.00",
+        status="needs_manual_review",
+        client_order_id=_DECISION,
+        entry_order_id=_TXID,
+    )
+
+    with aioresponses() as m:
+        _mock_cancel_venue(m, vol_exec="0.00000000", cost="0.00000")
+        assert await runner.cancel(decision_id=_DECISION) == EXIT_OK
+
+    status, closed_at, _qty, _price = await _ledger(db, live_id)
+    assert status == "rejected"
+    assert closed_at is not None
+    steps = _evidence_steps(tmp_path)
+    assert _step(steps, "cancel_zero_fill") is not None
+    assert _step(steps, "cancel_ledger_unchanged") is None
+    await adapter.close()
+    await db.close()
+
+
+async def test_cancel_reporting_a_fill_on_a_rejected_row_exits_for_review(tmp_path):
+    """'rejected' says the entry produced no position. If Kraken reports a
+    fill on that order, the account holds inventory the ledger does not know
+    about — that is not an OK exit."""
+    runner, db, adapter = await _make_runner(tmp_path)
+    live_id = await _seed_settled_row(db, status="rejected")
+    before = await _ledger(db, live_id)
+
+    with aioresponses() as m:
+        _mock_cancel_venue(m, vol_exec="0.05000000", cost="5.00000")
+        assert await runner.cancel(decision_id=_DECISION) == EXIT_REVIEW
+
+    assert await _ledger(db, live_id) == before
+    unchanged = _step(_evidence_steps(tmp_path), "cancel_ledger_unchanged")
+    assert unchanged["why"] == "row_already_settled"
+    assert unchanged["untracked_fill"] is True
+    await adapter.close()
+    await db.close()
+
+
+async def test_cancel_on_a_closed_row_is_not_reported_as_an_untracked_fill(tmp_path):
+    """A closed trade's entry order always shows its fill. That is expected,
+    not an alarm."""
+    runner, db, adapter = await _make_runner(tmp_path)
+    await _seed_settled_row(db, status="closed_via_reconciliation")
+
+    with aioresponses() as m:
+        _mock_cancel_venue(m, vol_exec="0.05000000", cost="5.00000")
+        assert await runner.cancel(decision_id=_DECISION) == EXIT_OK
+
+    unchanged = _step(_evidence_steps(tmp_path), "cancel_ledger_unchanged")
+    assert unchanged["why"] == "row_already_settled"
+    assert unchanged["untracked_fill"] is False
+    await adapter.close()
+    await db.close()
+
+
+async def test_cancel_does_not_restore_quantity_a_partial_exit_already_sold(tmp_path):
+    """entry_fill_qty is the HELD quantity: a partial exit reduces it and
+    records exit_order_id. Cancel must not put the entry order's full fill
+    back over it."""
+    runner, db, adapter = await _make_runner(tmp_path)
+    live_id = await _seed_kraken_row(
+        db,
+        size_usd="15.00",
+        status="open",
+        client_order_id=_DECISION,
+        entry_order_id=_TXID,
+    )
+    await db._conn.execute(
+        "UPDATE live_trades SET entry_fill_qty = '0.02000000', "
+        "entry_fill_price = '100.00', exit_order_id = 'OEXIT-1' WHERE id = ?",
+        (live_id,),
+    )
+    await db._conn.commit()
+    before = await _ledger(db, live_id)
+
+    with aioresponses() as m:
+        _mock_cancel_venue(m, vol_exec="0.05000000", cost="5.00000")
+        assert await runner.cancel(decision_id=_DECISION) == EXIT_OK
+
+    assert await _ledger(db, live_id) == before
+    steps = _evidence_steps(tmp_path)
+    unchanged = _step(steps, "cancel_ledger_unchanged")
+    assert unchanged["why"] == "exit_already_recorded"
+    assert _step(steps, "cancel_partial_fill") is None
+    await adapter.close()
+    await db.close()
+
+
+async def test_cancel_partial_fill_records_the_rows_real_status(tmp_path):
+    runner, db, adapter = await _make_runner(tmp_path)
+    await _seed_kraken_row(
+        db,
+        size_usd="15.00",
+        status="needs_manual_review",
+        client_order_id=_DECISION,
+        entry_order_id=_TXID,
+    )
+
+    with aioresponses() as m:
+        _mock_cancel_venue(m, vol_exec="0.05000000", cost="5.00000")
+        assert await runner.cancel(decision_id=_DECISION) == EXIT_OK
+
+    partial = _step(_evidence_steps(tmp_path), "cancel_partial_fill")
+    assert partial["ledger_status"] == "needs_manual_review"
+    await adapter.close()
+    await db.close()
+
+
+async def test_cancel_does_not_reject_a_row_whose_fill_the_ledger_records(
+    tmp_path, capsys
+):
+    """The ledger says this order filled. If the venue lookup at cancel time
+    shows no fill (or finds nothing), the two disagree — writing 'rejected'
+    would erase a recorded position and unblock the lane."""
+    runner, db, adapter = await _make_runner(tmp_path)
+    live_id = await _seed_kraken_row(
+        db,
+        size_usd="15.00",
+        status="open",
+        client_order_id=_DECISION,
+        entry_order_id=_TXID,
+    )
+    await db._conn.execute(
+        "UPDATE live_trades SET entry_fill_qty = '0.10000000', "
+        "entry_fill_price = '100.00' WHERE id = ?",
+        (live_id,),
+    )
+    await db._conn.commit()
+    before = await _ledger(db, live_id)
+
+    with aioresponses() as m:
+        _mock_cancel_venue(m, vol_exec="0.00000000", cost="0.00000")
+        assert await runner.cancel(decision_id=_DECISION) == EXIT_REVIEW
+
+    assert await _ledger(db, live_id) == before
+    steps = _evidence_steps(tmp_path)
+    assert _step(steps, "cancel_ledger_unchanged")["why"] == "ledger_records_a_fill"
+    assert _step(steps, "cancel_zero_fill") is None
+    assert "CHECK THE VENUE ACCOUNT" in capsys.readouterr().out
+    await adapter.close()
+    await db.close()
+
+
+async def test_cancel_keeps_held_quantity_when_an_exit_fill_has_no_order_id(tmp_path):
+    """A partial exit can be recorded with exit_fill_price set and no
+    exit_order_id. That is still an exit."""
+    runner, db, adapter = await _make_runner(tmp_path)
+    live_id = await _seed_kraken_row(
+        db,
+        size_usd="15.00",
+        status="open",
+        client_order_id=_DECISION,
+        entry_order_id=_TXID,
+    )
+    await db._conn.execute(
+        "UPDATE live_trades SET entry_fill_qty = '0.02000000', "
+        "entry_fill_price = '100.00', exit_fill_price = '101.00' WHERE id = ?",
+        (live_id,),
+    )
+    await db._conn.commit()
+    before = await _ledger(db, live_id)
+
+    with aioresponses() as m:
+        _mock_cancel_venue(m, vol_exec="0.05000000", cost="5.00000")
+        assert await runner.cancel(decision_id=_DECISION) == EXIT_OK
+
+    assert await _ledger(db, live_id) == before
+    await adapter.close()
+    await db.close()
+
+
+async def test_cancel_after_an_exit_says_the_position_still_blocks(tmp_path, capsys):
+    runner, db, adapter = await _make_runner(tmp_path)
+    live_id = await _seed_kraken_row(
+        db,
+        size_usd="15.00",
+        status="open",
+        client_order_id=_DECISION,
+        entry_order_id=_TXID,
+    )
+    await db._conn.execute(
+        "UPDATE live_trades SET entry_fill_qty = '0.02000000', "
+        "exit_order_id = 'OEXIT-1' WHERE id = ?",
+        (live_id,),
+    )
+    await db._conn.commit()
+
+    with aioresponses() as m:
+        _mock_cancel_venue(m, vol_exec="0.05000000", cost="5.00000")
+        assert await runner.cancel(decision_id=_DECISION) == EXIT_OK
+
+    assert "still blocks" in capsys.readouterr().out
+    await adapter.close()
+    await db.close()
+
+
+@pytest.mark.parametrize(
+    "qty,price,expect_rejected",
+    [
+        (None, None, True),  # the ordinary resting order
+        ("0.00000000", None, True),  # a recorded zero is not a fill
+        ("", None, True),
+        ("abc", None, False),  # unreadable: do not assume "no fill"
+        (".", None, False),  # no digit at all: unreadable, not zero
+        ("0.0.0", None, False),  # two decimal points: unreadable
+        ("-0", None, False),  # signs never come from _fmt: treat as unreadable
+        (None, "100.00", False),  # a price without a quantity is still a fill
+        ("0.10000000", "100.00", False),
+    ],
+)
+async def test_zero_fill_cancel_rejects_only_a_row_with_no_recorded_fill(
+    tmp_path, qty, price, expect_rejected
+):
+    runner, db, adapter = await _make_runner(tmp_path)
+    live_id = await _seed_kraken_row(
+        db,
+        size_usd="15.00",
+        status="open",
+        client_order_id=_DECISION,
+        entry_order_id=_TXID,
+    )
+    await db._conn.execute(
+        "UPDATE live_trades SET entry_fill_qty = ?, entry_fill_price = ? WHERE id = ?",
+        (qty, price, live_id),
+    )
+    await db._conn.commit()
+
+    with aioresponses() as m:
+        _mock_cancel_venue(m, vol_exec="0.00000000", cost="0.00000")
+        code = await runner.cancel(decision_id=_DECISION)
+
+    status = (await _ledger(db, live_id))[0]
+    if expect_rejected:
+        assert (code, status) == (EXIT_OK, "rejected")
+    else:
+        assert (code, status) == (EXIT_REVIEW, "open")
+    await adapter.close()
+    await db.close()

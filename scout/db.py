@@ -1753,6 +1753,10 @@ class Database:
         ``coin_id`` may be NULL to mark a resolution as *attempted* (negative
         result), which the resolver's TTL uses to avoid re-hammering the API.
         A later positive resolution upserts over it. Never feeds scorer/gate.
+
+        The reverse never happens: a NULL write leaves an existing resolved
+        row exactly as it is. The new-pools lane stamps NULL for every pool
+        it sees on this same key, and must not erase what the resolver found.
         """
         from scout.instrumentation.classify import classify_contract
 
@@ -1771,7 +1775,9 @@ class Database:
             "ON CONFLICT(contract_address, chain) DO UPDATE SET "
             "coin_id = excluded.coin_id, resolved_at = excluded.resolved_at, "
             "source = excluded.source, confidence = excluded.confidence, "
-            "address_type = excluded.address_type",
+            "address_type = excluded.address_type "
+            "WHERE excluded.coin_id IS NOT NULL "
+            "OR contract_coin_map.coin_id IS NULL",
             (contract_address, chain, coin_id, now, source, confidence, address_type),
         )
         await self._conn.commit()

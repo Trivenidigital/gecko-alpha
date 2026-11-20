@@ -95,6 +95,12 @@ python -m scout.live.kraken_pilot cancel --decision-id <uuid>  # pull it if so
 rm <db>.pilot.lock                                             # only then
 ```
 
+Delete the lock only after `cancel` exits 0 **and** `status` shows nothing
+resting. Exit 4 from `cancel` means the ledger and Kraken disagree about a
+fill: the ledger row was left as it was, and the account must be checked
+first. Exit 0 can still leave a row that blocks the next `place` (a position
+exists, or an exit is already recorded); `cancel` says so when it does.
+
 ## The run
 
 ```bash
@@ -126,7 +132,7 @@ python -m scout.live.kraken_pilot cancel --decision-id <uuid>  # pull it
 | 1 | A gate refused, or you did not authorize | Read the reason. No order exists. |
 | 2 | Lane blocked (prior row, unknown resting order, lock held) | Resolve what it names, then retry. |
 | 3 | Unresolved submission, or an unexpected failure | **State is unknown.** Check the Kraken UI before anything else. NEVER resend. |
-| 4 | Traded, but the balance move could not be explained | Check the account before the next run. |
+| 4 | Traded, but the balance move could not be explained. From `cancel`: the ledger and Kraken disagree about a fill (the ledger row is left unchanged) | Check the account before the next run. |
 
 ## If it goes wrong
 

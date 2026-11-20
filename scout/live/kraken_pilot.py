@@ -267,6 +267,8 @@ log = structlog.get_logger(__name__)
 #   4  EXIT_REVIEW    the order completed but the post-trade reconciliation
 #                     could not explain the balance move. Money moved in a way
 #                     the runner cannot account for — check before the next run.
+#                     Also `cancel` when the ledger and the venue disagree
+#                     about a fill; the ledger row is left unchanged.
 EXIT_OK = 0
 EXIT_REFUSED = 1
 EXIT_BLOCKED = 2
@@ -285,6 +287,24 @@ _ANCHOR_OPENED_AT = "1970-01-01T00:00:00+00:00"
 # live_trades statuses that mean "an order may still exist at the venue".
 # Any row in one of these blocks a new placement (one live order at a time).
 _BLOCKING_STATUSES = ("open", "needs_manual_review")
+# Row-level facts cancel() must respect before it rewrites the ledger. An
+# exit is recorded by exit_order_id, or by exit_fill_price alone when the
+# exit's txid was not known (_record_partial_exit accepts txid=None).
+_NO_EXIT_RECORDED = "exit_order_id IS NULL AND exit_fill_price IS NULL"
+# "No entry fill" means no price, and a quantity that is absent, blank or a
+# plain zero ("0", "0.00000000" — _fmt writes fixed-point): digits and at most
+# one decimal point, at least one digit, and no digit other than 0. Anything
+# else, including a value that cannot be read as a number (".", "0.0.0",
+# "abc", "-0"), counts as a recorded fill: CAST would turn 'abc' into 0 and
+# wave it through.
+_NO_ENTRY_FILL_RECORDED = (
+    "entry_fill_price IS NULL AND ("
+    "entry_fill_qty IS NULL OR TRIM(entry_fill_qty) = '' OR ("
+    "TRIM(entry_fill_qty) NOT GLOB '*[^0-9.]*' "
+    "AND TRIM(entry_fill_qty) GLOB '*[0-9]*' "
+    "AND TRIM(entry_fill_qty) NOT GLOB '*.*.*' "
+    "AND TRIM(entry_fill_qty) NOT GLOB '*[1-9]*'))"
+)
 
 # Kraken's published default taker fee, used only when AssetPairs carries no
 # fee schedule for the pair. Always labelled ESTIMATE in the approval block.
@@ -585,6 +605,40 @@ async def update_live_trade(db: Database, live_trade_id: int, **columns: Any) ->
             (*columns.values(), live_trade_id),
         )
         await db._conn.commit()
+
+
+async def update_live_trade_if_status(
+    db: Database,
+    live_trade_id: int,
+    allowed_statuses: tuple[str, ...],
+    *,
+    and_where: str = "",
+    **columns: Any,
+) -> bool:
+    """:func:`update_live_trade`, applied only while the row's status is one
+    of ``allowed_statuses`` and the optional ``and_where`` condition holds.
+    Returns whether the row was written.
+
+    The tests are in the UPDATE's own WHERE clause, so they hold against
+    whatever the row is at write time, not what an earlier read saw. Like the
+    SET column names, ``and_where`` is a fixed SQL fragment from this
+    module's own call sites, never operator input, and takes no parameters.
+    """
+    if db._conn is None or db._txn_lock is None:
+        raise RuntimeError("Database not initialized.")
+    if not columns or not allowed_statuses:
+        return False
+    assignments = ", ".join(f"{name} = ?" for name in columns)
+    placeholders = ", ".join("?" for _ in allowed_statuses)
+    extra = f" AND ({and_where})" if and_where else ""
+    async with db._txn_lock:
+        cur = await db._conn.execute(
+            f"UPDATE live_trades SET {assignments} "
+            f"WHERE id = ? AND status IN ({placeholders}){extra}",
+            (*columns.values(), live_trade_id, *allowed_statuses),
+        )
+        await db._conn.commit()
+        return cur.rowcount == 1
 
 
 async def fetch_blocking_rows(db: Database) -> list[dict[str, Any]]:
@@ -5082,47 +5136,123 @@ class PilotRunner:
             filled_qty = _dec_or_none(None if conf is None else conf.filled_qty)
             partial = filled_qty is not None and filled_qty > 0
             fills: list[dict[str, Any]] = []
+            # The venue cancel above is never refused. The LEDGER write below
+            # is: it may only touch a row that still stands for an order that
+            # may be live (_BLOCKING_STATUSES). Writing 'rejected' — "the
+            # entry produced no position" — or fresh entry fills over a row
+            # that is already closed or rejected would rewrite settled
+            # history from a cancel-time lookup.
             if partial:
                 # A partially-filled cancel leaves REAL inventory. The row
-                # stays 'open' because a position exists; 'rejected' would
+                # keeps its status because a position exists; 'rejected' would
                 # assert nothing happened while the account holds coins.
                 lookup_txid = txid or (conf.venue_order_id if conf else None)
                 if lookup_txid:
                     fills = await self._adapter.fetch_order_fills(txid=str(lookup_txid))
-                await update_live_trade(
+                # entry_fill_qty is the HELD quantity: a partial exit reduces
+                # it (_record_partial_exit, "never restore"). So the entry
+                # order's fill may be written only while no exit has been
+                # recorded against the row.
+                ledger_written = await update_live_trade_if_status(
                     self._db,
                     row["live_trade_id"],
+                    _BLOCKING_STATUSES,
+                    and_where=_NO_EXIT_RECORDED,
                     entry_fill_price=_fmt(
                         _dec_or_none(None if conf is None else conf.fill_price)
                     ),
                     entry_fill_qty=_fmt(filled_qty),
                 )
-                evidence.record(
-                    "cancel_partial_fill",
-                    live_trade_id=row["live_trade_id"],
-                    ledger_status="open",
-                    filled_qty=_fmt(filled_qty),
-                    fills=fills,
-                    note="POSITION EXISTS — row stays open",
-                )
+                if ledger_written:
+                    evidence.record(
+                        "cancel_partial_fill",
+                        live_trade_id=row["live_trade_id"],
+                        ledger_status=row.get("status"),
+                        filled_qty=_fmt(filled_qty),
+                        fills=fills,
+                        note="POSITION EXISTS — row keeps its status",
+                    )
             else:
                 # Zero-fill cancel: the entry never happened. 'rejected' is the
                 # vocabulary's term for an entry that produced no position.
                 # reject_reason stays NULL — the CHECK enum has no
                 # operator-cancel member and this module does not widen it.
-                await update_live_trade(
+                # 'rejected' may be written only over a row the ledger does
+                # not itself show as filled or exited. If it does, the ledger
+                # and this cancel-time lookup disagree, and the lookup (which
+                # can also simply find nothing) does not get to erase a
+                # recorded position.
+                ledger_written = await update_live_trade_if_status(
                     self._db,
                     row["live_trade_id"],
+                    _BLOCKING_STATUSES,
+                    and_where=f"{_NO_ENTRY_FILL_RECORDED} AND {_NO_EXIT_RECORDED}",
                     status="rejected",
                     closed_at=datetime.now(timezone.utc).isoformat(),
                 )
+                if ledger_written:
+                    evidence.record(
+                        "cancel_zero_fill",
+                        live_trade_id=row["live_trade_id"],
+                        ledger_status="rejected",
+                        reject_reason=None,
+                        note="reject_reason left NULL: the CHECK enum has no "
+                        "operator-cancel value and the constraint is not widened "
+                        "here",
+                    )
+
+            ledger_status_now = row.get("status") if partial else "rejected"
+            unchanged_why: str | None = None
+            # 'rejected' asserts the entry produced no position. A fill
+            # reported on such a row is inventory the ledger does not know
+            # about. (On a closed row the entry order's fill is expected.)
+            untracked_fill = False
+            if not ledger_written:
+                cur = await self._db._conn.execute(
+                    "SELECT status, exit_order_id FROM live_trades WHERE id = ?",
+                    (row["live_trade_id"],),
+                )
+                current = await cur.fetchone()
+                ledger_status_now = current[0] if current else None
+                if ledger_status_now in _BLOCKING_STATUSES and partial:
+                    unchanged_why = "exit_already_recorded"
+                    note = (
+                        "the venue cancel was sent; an exit is already recorded "
+                        "against this row, so its held quantity was left as that "
+                        "exit recorded it"
+                    )
+                elif ledger_status_now in _BLOCKING_STATUSES:
+                    unchanged_why = "ledger_records_a_fill"
+                    note = (
+                        "the venue cancel was sent; the ledger records a fill or "
+                        "an exit on this row but the venue lookup shows none, so "
+                        "the row was NOT marked rejected"
+                    )
+                else:
+                    unchanged_why = "row_already_settled"
+                    note = (
+                        "the venue cancel was sent; the ledger row is already "
+                        "settled, so its status, close time and entry fills were "
+                        "left as they were"
+                    )
+                    untracked_fill = partial and ledger_status_now == "rejected"
                 evidence.record(
-                    "cancel_zero_fill",
+                    "cancel_ledger_unchanged",
                     live_trade_id=row["live_trade_id"],
-                    ledger_status="rejected",
-                    reject_reason=None,
-                    note="reject_reason left NULL: the CHECK enum has no "
-                    "operator-cancel value and the constraint is not widened here",
+                    ledger_status=ledger_status_now,
+                    why=unchanged_why,
+                    untracked_fill=untracked_fill,
+                    venue_filled_qty=_fmt(filled_qty) if partial else "0",
+                    fills=fills,
+                    note=note,
+                )
+                log.warning(
+                    "kraken_pilot_cancel_ledger_unchanged",
+                    decision_id=decision_id,
+                    live_trade_id=row["live_trade_id"],
+                    ledger_status=ledger_status_now,
+                    why=unchanged_why,
+                    untracked_fill=untracked_fill,
                 )
 
             balance_after = _dec(
@@ -5137,23 +5267,60 @@ class PilotRunner:
                 partial_fill=partial,
             )
 
+            if ledger_written:
+                headline = "PILOT ORDER CANCELLED" + (
+                    " — PARTIAL FILL" if partial else ""
+                )
+                row_label = (
+                    f"{ledger_status_now} (position exists)" if partial else "rejected"
+                )
+            elif unchanged_why == "exit_already_recorded":
+                headline = "PILOT CANCEL SENT — LEDGER ROW LEFT AS THE EXIT RECORDED IT"
+                row_label = f"{ledger_status_now} — an exit is recorded, unchanged"
+            elif unchanged_why == "ledger_records_a_fill":
+                headline = "PILOT CANCEL SENT — LEDGER AND VENUE DISAGREE"
+                row_label = f"{ledger_status_now} — a fill is recorded, unchanged"
+            else:
+                headline = "PILOT CANCEL SENT — LEDGER ROW ALREADY SETTLED"
+                row_label = f"{ledger_status_now} — left unchanged"
             _print_block(
-                "PILOT ORDER CANCELLED" + (" — PARTIAL FILL" if partial else ""),
+                headline,
                 [
                     f"  decision ID : {decision_id}",
-                    f"  ledger row  : {row['live_trade_id']} "
-                    f"({'open (position exists)' if partial else 'rejected'})",
+                    f"  ledger row  : {row['live_trade_id']} ({row_label})",
                     f"  filled qty  : {_fmt(filled_qty) if partial else '0'}",
                     f"  balance     : {_fmt(balance_before)} -> "
                     f"{_fmt(balance_after)} {balance_asset}",
                     f"  evidence    : {evidence.path}",
                 ],
             )
-            if partial:
+            if untracked_fill:
+                print(
+                    "CHECK THE VENUE ACCOUNT: Kraken reports a fill on this order, "
+                    "but its ledger row is 'rejected' (no position) and was not "
+                    "changed. The account may hold inventory the ledger does not "
+                    "track."
+                )
+                return EXIT_REVIEW
+            if unchanged_why == "ledger_records_a_fill":
+                print(
+                    "CHECK THE VENUE ACCOUNT: the ledger records a fill on this "
+                    "row, but Kraken shows none for the order. The row was not "
+                    f"marked rejected; it is still {ledger_status_now} and still "
+                    "blocks the next `place` run."
+                )
+                return EXIT_REVIEW
+            if unchanged_why == "exit_already_recorded":
+                print(
+                    "NOTE: a position exists on this row and an exit is already "
+                    f"recorded against it. The row is still {ledger_status_now} "
+                    "and still blocks the next `place` run until it is resolved."
+                )
+            if partial and ledger_written:
                 print(
                     "ACTION REQUIRED: a partial position exists and the ledger row "
-                    "is still open. It will block the next `place` run until you "
-                    "close the position and resolve the row."
+                    f"is still {ledger_status_now}. It will block the next `place` "
+                    "run until you close the position and resolve the row."
                 )
             return EXIT_OK
 
