@@ -1074,10 +1074,101 @@ async def test_a_caller_error_is_not_hidden_when_another_kill_is_in_force(tmp_pa
     await db.close()
 
 
-async def test_a_raised_trigger_failure_is_counted_once_by_the_caller(tmp_path):
-    """When trigger re-raises, the caller (maybe_trigger_from_daily_loss)
-    counts kill_trigger_errors; trigger must not count it as well."""
+# --- vector review findings at 78666322 --------------------------------------
+
+
+async def _metric(db, name):
+    cur = await db._conn.execute(
+        "SELECT COALESCE(SUM(value), 0) FROM live_metrics_daily WHERE metric = ?",
+        (name,),
+    )
+    return (await cur.fetchone())[0]
+
+
+async def test_an_attempt_whose_commits_all_fail_is_retried_and_its_claim_kept(
+    tmp_path,
+):
+    """Three failed commits close no transaction in attempt 1 (main commit +
+    two tries in _commit_or_log_locked). Attempt 1 must not judge anything;
+    attempt 2's commit makes attempt 1's claim durable, and that is this
+    call's win."""
     import sqlite3
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    alerts: list[str] = []
+
+    async def _hook(text):
+        alerts.append(text)
+
+    ks = KillSwitch(db, alert_hook=_hook)
+
+    async def _fail_three(n, real_commit):
+        if n <= 3:
+            raise sqlite3.OperationalError("database is locked")
+        await real_commit()
+
+    _calls, real_commit = _patch_commit(db, _fail_three)
+    try:
+        kid, won = await ks.trigger(
+            triggered_by="manual", reason="op", duration=timedelta(hours=1)
+        )
+    finally:
+        db._conn.commit = real_commit
+
+    assert won is True
+    assert db._conn.in_transaction is False
+    await db._conn.rollback()  # durable: survives a foreign rollback
+    state = await ks.is_active()
+    assert state is not None and state.kill_event_id == kid
+    assert sum("TRIGGERED" in a for a in alerts) == 1
+    await db.close()
+
+
+async def test_when_every_commit_fails_the_operator_is_told_a_claim_is_pending(
+    tmp_path,
+):
+    import sqlite3
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    alerts: list[str] = []
+
+    async def _hook(text):
+        alerts.append(text)
+
+    ks = KillSwitch(db, alert_hook=_hook)
+
+    async def _always_fail(n, real_commit):
+        raise sqlite3.OperationalError("database is locked")
+
+    _calls, real_commit = _patch_commit(db, _always_fail)
+    try:
+        with structlog.testing.capture_logs() as logs:
+            with pytest.raises(sqlite3.OperationalError):
+                await ks.trigger(
+                    triggered_by="daily_loss_cap",
+                    reason="breach",
+                    duration=timedelta(hours=4),
+                )
+    finally:
+        db._conn.commit = real_commit
+
+    unconfirmed = [e for e in logs if e.get("event") == "live_kill_trigger_unconfirmed"]
+    assert unconfirmed and unconfirmed[0]["pending_kill_event_ids"]
+    not_engaged = [a for a in alerts if "NOT ENGAGED" in a]
+    assert not_engaged and "pending" in not_engaged[0]
+    assert "--status" in not_engaged[0]
+    await db.close()
+
+
+async def test_a_raised_trigger_failure_is_counted_exactly_once(tmp_path):
+    """Counted inside trigger, so callers that do not count (the engine's
+    venue-fatal kills, the CLI) are covered; the daily-loss helper must not
+    count it again."""
+    import sqlite3
+
+    from scout.live.kill_switch import maybe_trigger_from_daily_loss
 
     db = Database(tmp_path / "t.db")
     await db.initialize()
@@ -1086,9 +1177,101 @@ async def test_a_raised_trigger_failure_is_counted_once_by_the_caller(tmp_path):
         await ks.trigger(
             triggered_by="not_a_valid_source", reason="x", duration=timedelta(hours=1)
         )
-    cur = await db._conn.execute(
-        "SELECT COALESCE(SUM(value), 0) FROM live_metrics_daily "
-        "WHERE metric = 'kill_trigger_errors'"
+    assert await _metric(db, "kill_trigger_errors") == 1
+
+    class _Boom(KillSwitch):
+        async def trigger(self, **kwargs):
+            return await KillSwitch.trigger(
+                self, **{**kwargs, "triggered_by": "not_a_valid_source"}
+            )
+
+    now = datetime.now(timezone.utc)
+    await db._conn.execute(
+        "INSERT INTO paper_trades (token_id, symbol, name, chain, signal_type, "
+        "signal_data, entry_price, amount_usd, quantity, tp_pct, sl_pct, tp_price, "
+        "sl_price, status, opened_at) VALUES ('t', 'T', 'T', 'eth', 'x', '{}', "
+        "1, 1, 1, 1, 1, 1, 1, 'open', ?)",
+        (now.isoformat(),),
     )
-    assert (await cur.fetchone())[0] == 0
+    cur = await db._conn.execute("SELECT last_insert_rowid()")
+    paper_id = (await cur.fetchone())[0]
+    cur = await db._conn.execute("PRAGMA table_info(shadow_trades)")
+    cols = {r[1]: r for r in await cur.fetchall()}
+    values = {
+        "paper_trade_id": paper_id,
+        "status": "closed_sl",
+        "closed_at": now.isoformat(),
+        "realized_pnl_usd": "-100000",
+    }
+    for name, (_cid, _n, ctype, notnull, default, pk) in cols.items():
+        if name in values or default is not None or pk or not notnull:
+            continue
+        values[name] = 0 if "INT" in (ctype or "").upper() else "x"
+    await db._conn.execute(
+        f"INSERT INTO shadow_trades ({', '.join(values)}) "
+        f"VALUES ({', '.join('?' for _ in values)})",
+        tuple(values.values()),
+    )
+    await db._conn.commit()
+
+    class _S:
+        LIVE_DAILY_LOSS_CAP_USD = 50
+        LIVE_TRADING_ENABLED = False
+
+    with pytest.raises(sqlite3.IntegrityError):
+        await maybe_trigger_from_daily_loss(db, _Boom(db), _S())
+    assert await _metric(db, "kill_trigger_errors") == 2  # one more, not two
+    await db.close()
+
+
+async def test_a_reused_event_id_is_not_mistaken_for_this_calls_kill(tmp_path):
+    """A foreign rollback also rolls back AUTOINCREMENT's counter, so an id
+    this call inserted (then lost) can be handed to someone else's row. That
+    row is not this call's kill."""
+    import sqlite3
+
+    dbp = tmp_path / "t.db"
+    db = Database(dbp)
+    await db.initialize()
+    alerts: list[str] = []
+
+    async def _hook(text):
+        alerts.append(text)
+
+    ks = KillSwitch(db, alert_hook=_hook)
+    real_execute = db._conn.execute
+    state = {"done": False}
+
+    async def _execute(sql, *args, **kwargs):
+        cur = await real_execute(sql, *args, **kwargs)
+        if "INSERT INTO kill_events" in sql and not state["done"]:
+            state["done"] = True
+            await db._conn.rollback()  # our row and the counter are undone
+            other = sqlite3.connect(dbp)
+            now = datetime.now(timezone.utc)
+            c = other.execute(
+                "INSERT INTO kill_events (triggered_by, reason, triggered_at, "
+                "killed_until) VALUES ('manual', 'someone else', ?, ?)",
+                ("2020-01-01T00:00:00+00:00", (now + timedelta(hours=2)).isoformat()),
+            )
+            state["other_id"] = c.lastrowid
+            other.execute(
+                "UPDATE live_control SET active_kill_event_id = ? WHERE id = 1",
+                (c.lastrowid,),
+            )
+            other.commit()
+            other.close()
+        return cur
+
+    db._conn.execute = _execute
+    try:
+        winner, won = await ks.trigger(
+            triggered_by="daily_loss_cap", reason="breach", duration=timedelta(hours=4)
+        )
+    finally:
+        db._conn.execute = real_execute
+
+    assert won is False
+    assert winner == state["other_id"]
+    assert not any("TRIGGERED" in a for a in alerts)
     await db.close()

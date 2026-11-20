@@ -4520,6 +4520,12 @@ class LaneRunner:
                 note="the execution row already records the landing "
                 "(most likely a concurrent `resolve`); not rewriting it",
             )
+            log.info(
+                "solana_lane_catch_up_state_skipped",
+                decision_id=decision_id,
+                wanted=catch_up,
+                current_state=current_state,
+            )
             return
         await self._state(decision_id, catch_up, mode=mode)
 

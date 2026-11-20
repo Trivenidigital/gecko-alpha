@@ -45,6 +45,9 @@ _LATCHED_ALERT_THRESHOLD = timedelta(hours=1)
 # trigger() retries an attempt that another writer's unlocked ROLLBACK
 # interfered with, at most this many times in total.
 _TRIGGER_ATTEMPTS = 3
+# Set on an exception trigger() re-raises after counting kill_trigger_errors,
+# so a caller that also counts failures does not count it twice.
+_COUNTED_ATTR = "kill_trigger_errors_counted"
 
 
 def compute_kill_duration(trigger_time: datetime) -> timedelta:
@@ -103,6 +106,7 @@ class KillSwitch:
         killed_until: datetime | None = None,
         cleared_by: str | None = None,
         latched_hours: float | None = None,
+        note: str | None = None,
     ) -> None:
         """Emit the §12b operator alert for an automated kill-switch transition.
 
@@ -131,6 +135,8 @@ class KillSwitch:
                 "as NOT halted and engage it by hand "
                 "(python -m scout.live.cli_kill --on ...)"
             )
+            if note:
+                message += f"\n{note}"
         elif event_type == "latched_auto_clear":
             # LIVE-01: the kill outlived killed_until and froze the shadow soak.
             hours = latched_hours if latched_hours is not None else 0.0
@@ -367,7 +373,10 @@ class KillSwitch:
         # Every speculative row this call inserted. A claim left uncommitted
         # by a failed commit can become durable during a LATER attempt; the
         # kill it engages is still this call's kill.
-        our_ids: set[int] = set()
+        # id -> triggered_at: the id alone is not proof, because a foreign
+        # rollback also rolls back AUTOINCREMENT's counter and an undone id
+        # can be handed to someone else's row.
+        our_ids: dict[int, str] = {}
         for attempt in range(1, _TRIGGER_ATTEMPTS + 1):
             async with self._db._txn_lock:
                 # Judged under the lock: a trigger that queued behind another
@@ -455,6 +464,10 @@ class KillSwitch:
         except ValueError:  # an unreadable killed_until on the pointer
             state = None
         active_id = state.kill_event_id if state is not None else None
+        # Rows of ours that may still be sitting in an open transaction: the
+        # next successful commit on this connection (anyone's) would engage
+        # them, after this call has reported failure.
+        pending = sorted(our_ids) if unconfirmable else []
         log.error(
             "live_kill_trigger_unconfirmed",
             triggered_by=triggered_by,
@@ -462,19 +475,31 @@ class KillSwitch:
             attempts=_TRIGGER_ATTEMPTS,
             active_kill_event_id=active_id,
             transaction_left_open=unconfirmable,
+            pending_kill_event_ids=pending,
             last_error=None if last_error is None else str(last_error),
         )
         will_raise = last_error is not None and state is None
         if state is None:
-            if not will_raise:
-                # A raised error is counted by the caller that catches it
-                # (maybe_trigger_from_daily_loss); count only what returns.
-                try:
-                    from scout.live.metrics import inc
+            # Counted here, once, for every caller: the engine's venue-fatal
+            # kills and the CLI do not count failures themselves. The raised
+            # error is marked so maybe_trigger_from_daily_loss does not count
+            # it again.
+            try:
+                from scout.live.metrics import inc
 
-                    await inc(self._db, "kill_trigger_errors")
-                except Exception:  # noqa: BLE001 - the alert below must still go
-                    log.exception("live_kill_trigger_metric_failed")
+                await inc(self._db, "kill_trigger_errors")
+            except Exception:  # noqa: BLE001 - the alert below must still go
+                log.exception("live_kill_trigger_metric_failed")
+            note = None
+            if pending:
+                note = (
+                    "claim #"
+                    + ", #".join(str(i) for i in pending)
+                    + " is pending in an open transaction and may still take "
+                    "effect on the next successful commit — check "
+                    "`python -m scout.live.cli_kill --status`; if --on fails "
+                    "with 'database is locked', restart the pipeline first"
+                )
             await self._emit_alert(
                 event_type="not_engaged",
                 kill_event_id=None,
@@ -484,8 +509,13 @@ class KillSwitch:
                     if last_error is None
                     else f"{reason} (last error: {last_error})"
                 ),
+                note=note,
             )
         if will_raise:
+            try:
+                setattr(last_error, _COUNTED_ATTR, True)
+            except AttributeError:
+                pass
             raise last_error
         return active_id, False
 
@@ -496,7 +526,7 @@ class KillSwitch:
         reason: str,
         now: datetime,
         killed_until: datetime,
-        our_ids: set[int],
+        our_ids: dict[int, str],
     ) -> tuple[
         str,
         int | None,
@@ -532,7 +562,7 @@ class KillSwitch:
             )
             cur = await conn.execute("SELECT last_insert_rowid()")
             new_id = (await cur.fetchone())[0]
-            our_ids.add(new_id)
+            our_ids[new_id] = now.isoformat()
             # Only after the INSERT has succeeded: if it raises (a CHECK on
             # triggered_by, say) nothing has been released.
             released = await self._release_dead_pointer_locked(now)
@@ -550,7 +580,9 @@ class KillSwitch:
             # KEY), or the commit hit a lock. End the transaction; what it
             # left behind is judged below from the committed state.
             error = exc
-            await self._commit_or_log_locked("trigger_attempt")
+            await self._commit_or_log_locked(
+                "trigger_attempt", kill_event_id=new_id, triggered_by=triggered_by
+            )
 
         if conn.in_transaction:
             # Both commits failed: what a read shows now is our own
@@ -561,24 +593,28 @@ class KillSwitch:
         # What is durably in force now? Committed state cannot be undone by a
         # later rollback, so this is the only safe basis for "won".
         cur = await conn.execute(
-            "SELECT lc.active_kill_event_id, ke.id "
+            "SELECT lc.active_kill_event_id, ke.id, ke.triggered_at "
             "FROM live_control AS lc "
             "LEFT JOIN kill_events AS ke ON ke.id = lc.active_kill_event_id "
             "WHERE lc.id = 1"
         )
         row = await cur.fetchone()
         pointer = row[0] if row is not None else None
-        if pointer is not None and pointer in our_ids and row[1] == pointer:
+        if pointer is not None and row[1] == pointer and our_ids.get(pointer) == row[2]:
             return "won", pointer, released, error
 
         # Our speculative rows, if any survived, must not linger unreferenced.
-        for orphan_id in sorted(our_ids - {pointer}):
+        # Matched on triggered_at as well, so a reused id is left alone.
+        for orphan_id, orphan_at in sorted(our_ids.items()):
+            if orphan_id == pointer:
+                continue
             try:
                 await conn.execute(
-                    "DELETE FROM kill_events WHERE id = ? AND id NOT IN ("
+                    "DELETE FROM kill_events WHERE id = ? AND triggered_at = ? "
+                    "AND id NOT IN ("
                     "SELECT active_kill_event_id FROM live_control "
                     "WHERE active_kill_event_id IS NOT NULL)",
-                    (orphan_id,),
+                    (orphan_id, orphan_at),
                 )
             except sqlite3.Error as exc:
                 log.error(
@@ -587,7 +623,9 @@ class KillSwitch:
                     error=str(exc),
                     error_type=type(exc).__name__,
                 )
-        await self._commit_or_log_locked("trigger_orphan_cleanup")
+        await self._commit_or_log_locked(
+            "trigger_orphan_cleanup", kill_event_ids=sorted(our_ids)
+        )
         if await self._pointer_is_dead_locked(now):
             return "retry", None, released, error
         return "lost", pointer, released, error
@@ -616,20 +654,23 @@ class KillSwitch:
                 error=str(exc),
                 error_type=type(exc).__name__,
             )
-        await self._commit_or_log_locked("released_event_stamp")
+        await self._commit_or_log_locked(
+            "released_event_stamp", kill_event_id=released_id
+        )
 
-    async def _commit_or_log_locked(self, what: str) -> bool:
-        """COMMIT, retrying once; log at ERROR if both fail. Returns whether
-        the transaction is closed. Caller holds the txn lock. A failed COMMIT
-        leaves the write transaction open, holding the database's write lock
-        against other processes, so it is worth one more try."""
+    async def _commit_or_log_locked(self, what: str, **context: object) -> None:
+        """COMMIT, retrying once; log at ERROR if both fail. Caller holds the
+        txn lock. A failed COMMIT leaves the write transaction open, holding
+        the database's write lock against other processes, so it is worth one
+        more try. Callers that must not act on uncommitted state check
+        ``conn.in_transaction`` themselves afterwards."""
         conn = self._db._conn
         assert conn is not None
         last: sqlite3.Error | None = None
         for _ in range(2):
             try:
                 await conn.commit()
-                return True
+                return
             except sqlite3.Error as exc:
                 last = exc
         log.error(
@@ -638,8 +679,8 @@ class KillSwitch:
             error=str(last),
             error_type=type(last).__name__,
             transaction_left_open=bool(conn.in_transaction),
+            **context,
         )
-        return not conn.in_transaction
 
     async def clear(self, *, cleared_by: str) -> int | None:
         """Clear the active kill, if any. Returns the cleared event id, or
@@ -856,10 +897,11 @@ async def maybe_trigger_from_daily_loss(
     except Exception as exc:
         from scout.live.metrics import inc
 
-        try:
-            await inc(db, "kill_trigger_errors")
-        except Exception:  # noqa: BLE001 - the error log below must still go
-            log.exception("live_kill_trigger_metric_failed")
+        if not getattr(exc, _COUNTED_ATTR, False):
+            try:
+                await inc(db, "kill_trigger_errors")
+            except Exception:  # noqa: BLE001 - the error log below must still go
+                log.exception("live_kill_trigger_metric_failed")
         log.error(
             "live_kill_trigger_failed",
             exception=str(exc),

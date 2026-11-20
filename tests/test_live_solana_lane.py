@@ -4871,8 +4871,16 @@ async def test_catch_up_rechecks_when_the_row_moves_between_check_and_write(
         stale["armed"] = True
 
     async def _load(db, decision_id):
+        import sys
+
         row = await real_load(db, decision_id)
-        if stale["armed"] and not stale["used"] and row is not None:
+        caller = sys._getframe(1).f_code.co_name
+        if (
+            caller == "_catch_up_after_adoption"
+            and stale["armed"]
+            and not stale["used"]
+            and row is not None
+        ):
             stale["used"] = True
             return {**row, "state": solana_lane.STATE_SUBMISSION_ATTEMPTED}
         return row
@@ -4906,8 +4914,16 @@ async def test_catch_up_survives_the_row_moving_twice(tmp_path, monkeypatch):
         stale["armed"] = True
 
     async def _load(db, decision_id):
+        import sys
+
         row = await real_load(db, decision_id)
-        if stale["armed"] and stale["left"] > 0 and row is not None:
+        caller = sys._getframe(1).f_code.co_name
+        if (
+            caller == "_catch_up_after_adoption"
+            and stale["armed"]
+            and stale["left"] > 0
+            and row is not None
+        ):
             stale["left"] -= 1
             return {**row, "state": solana_lane.STATE_SUBMISSION_ATTEMPTED}
         return row
