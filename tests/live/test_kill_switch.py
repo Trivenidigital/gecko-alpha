@@ -1427,9 +1427,10 @@ async def test_a_database_error_in_the_read_back_does_not_escape(tmp_path):
 async def test_orphan_cleanup_never_deletes_another_writers_row_with_a_reused_id(
     tmp_path,
 ):
-    """Our insert is undone and its id is reused by another writer's row that
-    is NOT the pointer (a historical, cleared event). Cleanup keyed on id
-    alone would delete it."""
+    """A foreign rollback right after our claim undoes our insert AND claim,
+    and rewinds AUTOINCREMENT; another writer then inserts a row (a
+    historical, cleared event - not the pointer) that gets our old id. Our
+    cleanup of "our" leftover row by id alone would delete theirs."""
     import sqlite3
 
     dbp = tmp_path / "t.db"
@@ -1441,7 +1442,11 @@ async def test_orphan_cleanup_never_deletes_another_writers_row_with_a_reused_id
 
     async def _execute(sql, *args, **kwargs):
         cur = await real_execute(sql, *args, **kwargs)
-        if "INSERT INTO kill_events" in sql and not state["done"]:
+        if (
+            "SET active_kill_event_id = ? WHERE id = 1 AND active_kill_event_id IS NULL"
+            in sql
+            and not state["done"]
+        ):
             state["done"] = True
             await db._conn.rollback()
             other = sqlite3.connect(dbp)
@@ -1465,7 +1470,7 @@ async def test_orphan_cleanup_never_deletes_another_writers_row_with_a_reused_id
     finally:
         db._conn.execute = real_execute
 
-    assert won is True
+    assert state["done"] and won is True
     cur = await db._conn.execute(
         "SELECT reason FROM kill_events WHERE id = ?", (state["other_id"],)
     )
@@ -1521,4 +1526,181 @@ async def test_trigger_stays_correct_on_a_clock_that_repeats_itself(
 
     assert sum(1 for r in results if r[1]) == 1, results
     assert sum("TRIGGERED" in a for a in alerts) == 1
+    await db.close()
+
+
+# --- vector review findings at fd0ced55 --------------------------------------
+
+
+def _fail_sql(db, needle: str, *, times: int | None = None):
+    import sqlite3
+
+    real_execute = db._conn.execute
+    left = {"n": times}
+
+    async def _execute(sql, *args, **kwargs):
+        if needle in sql and (left["n"] is None or left["n"] > 0):
+            if left["n"] is not None:
+                left["n"] -= 1
+            raise sqlite3.OperationalError("disk I/O error")
+        return await real_execute(sql, *args, **kwargs)
+
+    db._conn.execute = _execute
+    return real_execute
+
+
+async def test_a_persistently_failing_read_back_still_reports_this_calls_kill(
+    tmp_path,
+):
+    """The judging read fails every time, but the kill was committed and
+    is_active() can see it. It is this call's kill: report the win."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    alerts: list[str] = []
+
+    async def _hook(text):
+        alerts.append(text)
+
+    ks = KillSwitch(db, alert_hook=_hook)
+    real_execute = _fail_sql(db, "ke.id, ke.triggered_at")
+    try:
+        kid, won = await ks.trigger(
+            triggered_by="manual", reason="op", duration=timedelta(hours=1)
+        )
+    finally:
+        db._conn.execute = real_execute
+
+    assert won is True
+    state = await ks.is_active()
+    assert state is not None and state.kill_event_id == kid
+    assert sum("TRIGGERED" in a for a in alerts) == 1
+    await db.close()
+
+
+async def test_when_no_read_of_the_switch_works_the_operator_is_told(tmp_path):
+    import sqlite3
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    alerts: list[str] = []
+
+    async def _hook(text):
+        alerts.append(text)
+
+    ks = KillSwitch(db, alert_hook=_hook)
+    real_execute = _fail_sql(db, "FROM live_control")
+    try:
+        with structlog.testing.capture_logs() as logs:
+            with pytest.raises(sqlite3.OperationalError):
+                await ks.trigger(
+                    triggered_by="manual", reason="op", duration=timedelta(hours=1)
+                )
+    finally:
+        db._conn.execute = real_execute
+
+    assert any("NOT ENGAGED" in a for a in alerts)
+    assert any(e.get("event") == "live_kill_trigger_unconfirmed" for e in logs)
+    await db.close()
+
+
+async def test_the_announced_expiry_is_the_winning_claims_own(tmp_path):
+    """Attempt 1's claim lands only later; the alert must give attempt 1's
+    killed_until, not that of a later attempt."""
+    import sqlite3
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    alerts: list[str] = []
+
+    async def _hook(text):
+        alerts.append(text)
+
+    ks = KillSwitch(db, alert_hook=_hook)
+
+    async def _fail_three(n, real_commit):
+        if n <= 3:
+            raise sqlite3.OperationalError("database is locked")
+        await real_commit()
+
+    _calls, real_commit = _patch_commit(db, _fail_three)
+    try:
+        kid, won = await ks.trigger(
+            triggered_by="manual", reason="op", duration=timedelta(hours=1)
+        )
+    finally:
+        db._conn.commit = real_commit
+
+    assert won is True
+    cur = await db._conn.execute(
+        "SELECT killed_until FROM kill_events WHERE id = ?", (kid,)
+    )
+    stored = datetime.fromisoformat((await cur.fetchone())[0]).isoformat()
+    triggered = [a for a in alerts if "TRIGGERED" in a]
+    assert triggered and stored in triggered[0]
+    await db.close()
+
+
+async def test_the_metric_is_skipped_while_a_claim_is_pending(tmp_path):
+    """Commits fail through every attempt and the final settle, then the
+    database frees up just before the metric write. That write's commit would
+    land the pending claim behind the NOT ENGAGED alert's back."""
+    import sqlite3
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    alerts: list[str] = []
+
+    async def _hook(text):
+        alerts.append(text)
+
+    ks = KillSwitch(db, alert_hook=_hook)
+    locked = {"on": True}
+
+    async def _locked_until_flag(n, real_commit):
+        if locked["on"]:
+            raise sqlite3.OperationalError("database is locked")
+        await real_commit()
+
+    real_present = ks._our_rows_present_locked
+
+    async def _present(our_ids):
+        result = await real_present(our_ids)
+        locked["on"] = False  # the database frees up right after the settle
+        return result
+
+    ks._our_rows_present_locked = _present
+    _calls, real_commit = _patch_commit(db, _locked_until_flag)
+    try:
+        with structlog.testing.capture_logs() as logs:
+            with pytest.raises(sqlite3.OperationalError):
+                await ks.trigger(
+                    triggered_by="daily_loss_cap",
+                    reason="breach",
+                    duration=timedelta(hours=4),
+                )
+        still_open = db._conn.in_transaction
+    finally:
+        db._conn.commit = real_commit
+
+    assert still_open is True  # nobody committed the pending claim
+    assert any(e.get("event") == "live_kill_trigger_metric_skipped" for e in logs)
+    assert any("NOT ENGAGED" in a and "pending" in a for a in alerts)
+    await db.close()
+
+
+async def test_a_failing_dead_pointer_check_is_a_retry_not_an_exception(tmp_path):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    ks = KillSwitch(db)
+    live_id, _ = await ks.trigger(
+        triggered_by="manual", reason="first", duration=timedelta(hours=1)
+    )
+    real_execute = _fail_sql(db, "ke.killed_until FROM live_control", times=1)
+    try:
+        winner, won = await ks.trigger(
+            triggered_by="manual", reason="second", duration=timedelta(hours=1)
+        )
+    finally:
+        db._conn.execute = real_execute
+    assert (winner, won) == (live_id, False)
     await db.close()

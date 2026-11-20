@@ -393,6 +393,9 @@ class KillSwitch:
         # rollback also rolls back AUTOINCREMENT's counter and an undone id
         # can be handed to someone else's row.
         our_ids: dict[int, str] = {}
+        # id -> the killed_until that row was written with, so a claim that
+        # lands in a later attempt is announced with its own expiry.
+        our_until: dict[int, datetime] = {}
         for attempt in range(1, _TRIGGER_ATTEMPTS + 1):
             async with self._db._txn_lock:
                 # Judged under the lock: a trigger that queued behind another
@@ -400,6 +403,7 @@ class KillSwitch:
                 # per attempt: it is half of how this call knows its own row.
                 now = _unique_utc_now()
                 killed_until = now + duration
+                ids_before = set(our_ids)
                 verdict, event_id, attempt_released, error = (
                     await self._trigger_attempt_locked(
                         triggered_by=triggered_by,
@@ -409,6 +413,8 @@ class KillSwitch:
                         our_ids=our_ids,
                     )
                 )
+                for new in set(our_ids) - ids_before:
+                    our_until[new] = killed_until
                 # A release that a later attempt cannot see again (it was
                 # committed, or half-committed by an error path) still
                 # happened: keep the first one for the alert and the stamp.
@@ -423,7 +429,7 @@ class KillSwitch:
                     released=released,
                     triggered_by=triggered_by,
                     reason=reason,
-                    killed_until=killed_until,
+                    killed_until=our_until.get(event_id, killed_until),
                     attempts=attempt,
                 )
                 return event_id, True
@@ -481,22 +487,43 @@ class KillSwitch:
                 # the open transaction sees them), so the operator knows
                 # which claim may yet take effect.
                 pending = await self._our_rows_present_locked(our_ids)
+        unconfirmable = bool(conn.in_transaction)
+        state = None
+        if settled is None and not unconfirmable:
+            try:
+                state = await self.is_active()
+            except ValueError:  # an unreadable killed_until on the pointer
+                state = None
+            except sqlite3.Error as exc:
+                # The switch cannot be read at all: nothing can be confirmed.
+                state, last_error = None, last_error or exc
+            if state is not None and await self._is_ours(
+                state, our_ids, triggered_by, reason
+            ):
+                # The judging read failed, but the kill in force is this
+                # call's own: it engaged, so report it as engaged.
+                settled = state.kill_event_id
         if settled is not None:
             await self._announce_win(
                 event_id=settled,
                 released=released,
                 triggered_by=triggered_by,
                 reason=reason,
-                killed_until=killed_until,
+                killed_until=our_until.get(settled, killed_until),
                 attempts=_TRIGGER_ATTEMPTS,
             )
             return settled, True
-        unconfirmable = bool(conn.in_transaction)
-        try:
-            state = None if unconfirmable else await self.is_active()
-        except ValueError:  # an unreadable killed_until on the pointer
-            state = None
         active_id = state.kill_event_id if state is not None else None
+        if state is not None and last_error is not None:
+            # Trading is halted by another kill, but this call failed for its
+            # own reason; do not let that hide behind the other kill.
+            log.error(
+                "live_kill_trigger_error_while_lost",
+                winner_id=active_id,
+                triggered_by=triggered_by,
+                error=str(last_error),
+                error_type=type(last_error).__name__,
+            )
         log.error(
             "live_kill_trigger_unconfirmed",
             triggered_by=triggered_by,
@@ -508,6 +535,7 @@ class KillSwitch:
             last_error=None if last_error is None else str(last_error),
         )
         will_raise = last_error is not None and state is None
+        counted = False
         if state is None:
             # Counted here, once, for every caller: the engine's venue-fatal
             # kills and the CLI do not count failures themselves. The raised
@@ -526,6 +554,7 @@ class KillSwitch:
                     from scout.live.metrics import inc
 
                     await inc(self._db, "kill_trigger_errors")
+                    counted = True
                 except Exception:  # noqa: BLE001 - the alert below must still go
                     log.exception("live_kill_trigger_metric_failed")
             note = None
@@ -550,10 +579,13 @@ class KillSwitch:
                 note=note,
             )
         if will_raise:
-            try:
-                setattr(last_error, _COUNTED_ATTR, True)
-            except AttributeError:
-                pass
+            if counted:
+                # Only when it really was counted: a caller that counts its
+                # own failures must not skip one nobody recorded.
+                try:
+                    setattr(last_error, _COUNTED_ATTR, True)
+                except AttributeError:
+                    pass
             raise last_error
         return active_id, False
 
@@ -640,8 +672,9 @@ class KillSwitch:
             row = await cur.fetchone()
         except sqlite3.Error as exc:
             # Nothing can be judged; the next attempt (or the final settle)
-            # reads again, and a persistent error surfaces through the
-            # NOT ENGAGED path.
+            # reads again. If reads keep failing, the final step decides from
+            # is_active(), or reports NOT ENGAGED if the switch cannot be
+            # read at all.
             return "retry", None, released, error or exc
         pointer = row[0] if row is not None else None
         if pointer is not None and row[1] == pointer and our_ids.get(pointer) == row[2]:
@@ -709,9 +742,39 @@ class KillSwitch:
                 )
                 if await cur.fetchone() is not None:
                     present.append(event_id)
-            except sqlite3.Error:
+            except sqlite3.Error as exc:
+                log.error(
+                    "live_kill_pending_row_unreadable",
+                    kill_event_id=event_id,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
                 present.append(event_id)  # unknown: say it may be pending
         return present
+
+    async def _is_ours(
+        self,
+        state: KillState,
+        our_ids: dict[int, str],
+        triggered_by: str,
+        reason: str,
+    ) -> bool:
+        """Whether the kill in force is one of this call's rows: same id and
+        same triggered_at; if triggered_at cannot be read, same id, reason and
+        triggered_by (a reused id would carry another writer's text)."""
+        if state.kill_event_id not in our_ids:
+            return False
+        conn = self._db._conn
+        assert conn is not None
+        try:
+            cur = await conn.execute(
+                "SELECT triggered_at FROM kill_events WHERE id = ?",
+                (state.kill_event_id,),
+            )
+            row = await cur.fetchone()
+            return row is not None and row[0] == our_ids[state.kill_event_id]
+        except sqlite3.Error:
+            return state.reason == reason and state.triggered_by == triggered_by
 
     async def _announce_win(
         self,
