@@ -1378,6 +1378,11 @@ async def test_a_pending_claim_made_durable_at_the_end_is_reported_as_the_win(
     assert state is not None and state.kill_event_id == kid
     assert sum("TRIGGERED" in a for a in alerts) == 1
     assert not any("NOT ENGAGED" in a for a in alerts)
+    cur = await db._conn.execute(
+        "SELECT killed_until FROM kill_events WHERE id = ?", (kid,)
+    )
+    stored = datetime.fromisoformat((await cur.fetchone())[0]).isoformat()
+    assert stored in [a for a in alerts if "TRIGGERED" in a][0]
     await db.close()
 
 
@@ -1748,4 +1753,191 @@ async def test_a_foreign_transaction_after_the_settle_commit_does_not_hide_the_w
     assert state is not None and state.kill_event_id == kid
     assert sum("TRIGGERED" in a for a in alerts) == 1
     assert not any("NOT ENGAGED" in a for a in alerts)
+    await db.close()
+
+
+# --- vector review findings at d45ad7db --------------------------------------
+
+
+async def test_same_reason_triggers_with_failing_reads_never_both_win(tmp_path):
+    """A's insert is undone and B reuses its id and wins; A's judging read
+    keeps failing. A must not claim B's kill just because the reason and
+    source match."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    alerts: list[str] = []
+
+    async def _hook(text):
+        alerts.append(text)
+
+    ks_a = KillSwitch(db, alert_hook=_hook)
+    ks_b = KillSwitch(db, alert_hook=_hook)
+    real_execute = db._conn.execute
+    state = {"rolled": False}
+
+    async def _execute(sql, *args, **kwargs):
+        import sqlite3
+
+        if "ke.id, ke.triggered_at" in sql or "SELECT triggered_at FROM" in sql:
+            raise sqlite3.OperationalError("disk I/O error")
+        cur = await real_execute(sql, *args, **kwargs)
+        if "INSERT INTO kill_events" in sql and not state["rolled"]:
+            state["rolled"] = True
+            await db._conn.rollback()
+        return cur
+
+    db._conn.execute = _execute
+    try:
+        results = await asyncio.gather(
+            ks_a.trigger(
+                triggered_by="daily_loss_cap",
+                reason="breach",
+                duration=timedelta(hours=4),
+            ),
+            ks_b.trigger(
+                triggered_by="daily_loss_cap",
+                reason="breach",
+                duration=timedelta(hours=4),
+            ),
+            return_exceptions=True,
+        )
+    finally:
+        db._conn.execute = real_execute
+
+    wins = [r for r in results if isinstance(r, tuple) and r[1]]
+    assert len(wins) <= 1, results
+    assert sum("TRIGGERED" in a for a in alerts) == len(wins)
+    await db.close()
+
+
+async def test_daily_loss_caller_does_not_commit_a_pending_claim(tmp_path):
+    """Every commit inside trigger fails, so the claim is pending in an open
+    transaction and trigger deliberately skips the metric. The daily-loss
+    caller must not then commit it with its own metric write."""
+    import sqlite3
+
+    from scout.live.kill_switch import maybe_trigger_from_daily_loss
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    ks = KillSwitch(db)
+    now = datetime.now(timezone.utc)
+    await db._conn.execute(
+        "INSERT INTO paper_trades (token_id, symbol, name, chain, signal_type, "
+        "signal_data, entry_price, amount_usd, quantity, tp_pct, sl_pct, tp_price, "
+        "sl_price, status, opened_at) VALUES ('t', 'T', 'T', 'eth', 'x', '{}', "
+        "1, 1, 1, 1, 1, 1, 1, 'open', ?)",
+        (now.isoformat(),),
+    )
+    cur = await db._conn.execute("SELECT last_insert_rowid()")
+    paper_id = (await cur.fetchone())[0]
+    cur = await db._conn.execute("PRAGMA table_info(shadow_trades)")
+    cols = {r[1]: r for r in await cur.fetchall()}
+    values = {
+        "paper_trade_id": paper_id,
+        "status": "closed_sl",
+        "closed_at": now.isoformat(),
+        "realized_pnl_usd": "-100000",
+    }
+    for name, (_cid, _n, ctype, notnull, default, pk) in cols.items():
+        if name in values or default is not None or pk or not notnull:
+            continue
+        values[name] = 0 if "INT" in (ctype or "").upper() else "x"
+    await db._conn.execute(
+        f"INSERT INTO shadow_trades ({', '.join(values)}) "
+        f"VALUES ({', '.join('?' for _ in values)})",
+        tuple(values.values()),
+    )
+    await db._conn.commit()
+
+    locked = {"on": True}
+
+    async def _locked(n, real_commit):
+        if locked["on"]:
+            raise sqlite3.OperationalError("database is locked")
+        await real_commit()
+
+    real_present = ks._our_rows_present_locked
+
+    async def _present(our_ids):
+        result = await real_present(our_ids)
+        locked["on"] = False  # frees up once trigger has given up
+        return result
+
+    ks._our_rows_present_locked = _present
+    _calls, real_commit = _patch_commit(db, _locked)
+
+    class _S:
+        LIVE_DAILY_LOSS_CAP_USD = 50
+        LIVE_TRADING_ENABLED = False
+
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            await maybe_trigger_from_daily_loss(db, ks, _S())
+        still_open = db._conn.in_transaction
+    finally:
+        db._conn.commit = real_commit
+    assert still_open is True
+    await db.close()
+
+
+async def test_a_win_judged_after_a_foreign_transaction_opens_needs_no_retry(
+    tmp_path,
+):
+    """The attempt's own commit succeeded; an unlocked writer then opens a
+    transaction. The attempt must still judge itself (one attempt), not
+    retry because in_transaction reads True."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    ks = KillSwitch(db)
+
+    async def _commit_then_foreign(n, real_commit):
+        await real_commit()
+        if n == 1:
+            await db._conn.execute(
+                "UPDATE live_metrics_daily SET value = value WHERE 0"
+            )
+
+    _calls, real_commit = _patch_commit(db, _commit_then_foreign)
+    try:
+        with structlog.testing.capture_logs() as logs:
+            _kid, won = await ks.trigger(
+                triggered_by="manual", reason="op", duration=timedelta(hours=1)
+            )
+    finally:
+        db._conn.commit = real_commit
+    await db._conn.commit()
+
+    assert won is True
+    triggered = [e for e in logs if e.get("event") == "live_kill_event_triggered"]
+    assert triggered and triggered[0]["attempts"] == 1
+    await db.close()
+
+
+async def test_a_reused_id_in_a_later_attempt_announces_that_attempts_expiry(
+    tmp_path,
+):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    alerts: list[str] = []
+
+    async def _hook(text):
+        alerts.append(text)
+
+    ks = KillSwitch(db, alert_hook=_hook)
+    fired, real_execute = _rollback_once_after(db, "INSERT INTO kill_events")
+    try:
+        kid, won = await ks.trigger(
+            triggered_by="manual", reason="op", duration=timedelta(hours=1)
+        )
+    finally:
+        db._conn.execute = real_execute
+
+    assert fired and won is True
+    cur = await db._conn.execute(
+        "SELECT killed_until FROM kill_events WHERE id = ?", (kid,)
+    )
+    stored = datetime.fromisoformat((await cur.fetchone())[0]).isoformat()
+    triggered = [a for a in alerts if "TRIGGERED" in a]
+    assert triggered and stored in triggered[0]
     await db.close()
