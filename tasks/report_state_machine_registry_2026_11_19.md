@@ -108,6 +108,10 @@ No action is flagged `executed-without-recorded-approval`.
 
 ## 7. Defects noticed (not fixed here)
 
+> **Update 2026-11-20:** items 1–5 below were fixed afterwards on the same
+> branch. See `tasks/report_state_machine_defect_fixes_2026_11_20.md` for what
+> changed, the review record and what is still open. Item 6 is not fixed.
+
 25 items are listed with file and line in section 4a of the findings
 document; this change alters no behavior, so none is fixed. The ones that
 touch money or safety controls:
